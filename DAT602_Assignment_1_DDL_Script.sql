@@ -152,10 +152,42 @@ BEGIN
         CONSTRAINT CK_NPC_Health CHECK (Health BETWEEN 0 AND MaxHealth)
     );
 
+    --CHATMESSAGE: global broadcast chat
+    CREATE TABLE dbo.ChatMessage (
+        MessageID       INT IDENTITY(1,1) NOT NULL,
+        SenderPlayerID  INT NOT NULL,
+        MessageText     VARCHAR(500) NOT NULL,
+        SentDate        DATETIME NOT NULL DEFAULT (GETDATE()),
+        CONSTRAINT PK_ChatMessage PRIMARY KEY CLUSTERED (MessageID),
+        CONSTRAINT FK_ChatMessage_Player FOREIGN KEY (SenderPlayerID)
+            REFERENCES dbo.Player (PlayerID) ON DELETE CASCADE
+    );
+
+    CREATE NONCLUSTERED INDEX IX_ChatMessage_SentDate ON dbo.ChatMessage (SentDate);
+
+
+    --TEST DATA: covers every CRUD situation from the CRUD table:
+    --login/lockout, registration, tile layout, item placement,
+    --movement, scoring, inventory, NPC/item movement, chat
+    --not all made this commit
+    -- Tiles: a 5x5 board (25 tiles), IDs assigned 1-25 in x-then-y order
+    DECLARE @x INT = 0, @y INT;
+    WHILE @x < 5
+    BEGIN
+        SET @y = 0;
+        WHILE @y < 5
+        BEGIN
+            INSERT INTO dbo.Tile (XPosition, YPosition) VALUES (@x, @y);
+            SET @y += 1;
+        END
+        SET @x += 1;
+    END
+
 END
 GO
 
 --procedure to build the database and populate test data
 EXEC dbo.usp_CreateGooseFighterDatabase;
 GO
+
 
