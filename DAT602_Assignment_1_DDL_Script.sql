@@ -109,9 +109,53 @@ BEGIN
             CHECK (SpawnRate IS NULL OR SpawnRate BETWEEN 0 AND 100)
     );
 
+    --ITEM: one row per item. Exactly one of TileID/HolderPlayerID/NestID is non null at once.
+    CREATE TABLE dbo.Item (
+        ItemID          INT IDENTITY(1,1) NOT NULL,
+        ItemTypeID      INT NOT NULL,
+        TileID          INT NULL,
+        HolderPlayerID  INT NULL,
+        NestID          INT NULL,
+        Ammo            INT NULL,
+        CONSTRAINT PK_Item PRIMARY KEY CLUSTERED (ItemID),
+        CONSTRAINT FK_Item_ItemType FOREIGN KEY (ItemTypeID)
+            REFERENCES dbo.ItemType (ItemTypeID),
+        CONSTRAINT FK_Item_Tile FOREIGN KEY (TileID)
+            REFERENCES dbo.Tile (TileID),
+        CONSTRAINT FK_Item_Player FOREIGN KEY (HolderPlayerID)
+            REFERENCES dbo.Player (PlayerID),
+        CONSTRAINT FK_Item_Nest FOREIGN KEY (NestID)
+            REFERENCES dbo.Nest (NestID),
+        CONSTRAINT CK_Item_Ammo CHECK (Ammo IS NULL OR Ammo >= 0),
+        CONSTRAINT CK_Item_OneLocation CHECK (
+            (CASE WHEN TileID IS NOT NULL THEN 1 ELSE 0 END
+           + CASE WHEN HolderPlayerID IS NOT NULL THEN 1 ELSE 0 END
+           + CASE WHEN NestID IS NOT NULL THEN 1 ELSE 0 END) = 1
+        )
+    );
+
+    CREATE NONCLUSTERED INDEX IX_Item_TileID ON dbo.Item (TileID);
+    CREATE NONCLUSTERED INDEX IX_Item_HolderPlayerID ON dbo.Item (HolderPlayerID);
+    CREATE NONCLUSTERED INDEX IX_Item_NestID ON dbo.Item (NestID);
+
+    --NPC (grey goose) table
+    CREATE TABLE dbo.NPC (
+        NPCID        INT IDENTITY(1,1) NOT NULL,
+        TileID       INT NOT NULL,
+        Health       INT NOT NULL DEFAULT (1000),
+        MaxHealth    INT NOT NULL DEFAULT (1000),
+        IsAlive      BIT NOT NULL DEFAULT (1),
+        RespawnTime  DATETIME NULL,
+        CONSTRAINT PK_NPC PRIMARY KEY CLUSTERED (NPCID),
+        CONSTRAINT FK_NPC_Tile FOREIGN KEY (TileID)
+            REFERENCES dbo.Tile (TileID),
+        CONSTRAINT CK_NPC_Health CHECK (Health BETWEEN 0 AND MaxHealth)
+    );
+
 END
 GO
 
 --procedure to build the database and populate test data
 EXEC dbo.usp_CreateGooseFighterDatabase;
 GO
+
