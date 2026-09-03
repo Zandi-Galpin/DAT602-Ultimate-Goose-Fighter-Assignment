@@ -52,8 +52,8 @@ BEGIN
     --PLAYER: accounts and live player state.
     CREATE TABLE dbo.Player (
         PlayerID             INT IDENTITY(1,1) NOT NULL,
-        Email                VARCHAR(100) NOT NULL,
-        Username             VARCHAR(50)  NOT NULL,
+        Email                VARCHAR(255) NOT NULL,
+        Username             VARCHAR(100)  NOT NULL,
         Password             VARCHAR(100) NOT NULL,
         Score                INT NOT NULL DEFAULT (0),
         Health               INT NOT NULL DEFAULT (4000),
@@ -169,7 +169,6 @@ BEGIN
     --TEST DATA: covers every CRUD situation from the CRUD table:
     --login/lockout, registration, tile layout, item placement,
     --movement, scoring, inventory, NPC/item movement, chat
-    --not all made this commit
     -- Tiles: a 5x5 board (25 tiles), IDs assigned 1-25 in x-then-y order
     DECLARE @x INT = 0, @y INT;
     WHILE @x < 5
@@ -183,8 +182,58 @@ BEGIN
         SET @x += 1;
     END
 
+    --Players: has admin, online player, offline player,
+    --locked-out player, and an admin created player who has
+    -- never logged in (no nest and no CurrentTileID yet)
+    INSERT INTO dbo.Player (Email, Username, Password, IsAdmin, IsOnline)
+    VALUES ('admin@goosefighter.com', 'AdminGoose', 'AdminPass123!', 1, 0);
+
+    INSERT INTO dbo.Player (Email, Username, Password, Score, Health, IsOnline, CurrentTileID)
+    VALUES ('zandi@example.com', 'ZandiGoose', 'Password123', 3, 3100, 1, 13);
+
+    INSERT INTO dbo.Player (Email, Username, Password, Score, Health, IsOnline, CurrentTileID)
+    VALUES ('mcplayer@example.com', 'McPlayerTwoington', 'Passw0rd!', 5, 4000, 0, 7);
+
+    INSERT INTO dbo.Player (Email, Username, Password, FailedLoginAttempts, IsLockedOut)
+    VALUES ('lockedout@example.com', 'LockedGoose', 'wrongpass', 5, 1);
+
+    INSERT INTO dbo.Player (Email, Username, Password)
+    VALUES ('newplayer@example.com', 'BranfNewGoose', 'TempPass1');
+
+    --nests for the two players who have spawned in
+    INSERT INTO dbo.Nest (PlayerID, TileID) VALUES (2, 13); -- ZandiGoose
+    INSERT INTO dbo.Nest (PlayerID, TileID) VALUES (3, 7);  -- McPlayerTwoington
+
+    --item types: all 4 holdable + 4 consumable
+    INSERT INTO dbo.ItemType (Name, Category, EffectDescription, SpawnRate) VALUES
+        ('Baseball Bat', 'Holdable',   '+50% attack damage',                         15.00),
+        ('Pellet Gun',   'Holdable',   '-50% attack damage, ranged, 3-10 ammo',      10.00),
+        ('Shield',       'Holdable',   '-50% incoming damage, -25% outgoing damage', 12.00),
+        ('Grenade',      'Holdable',   'Thrown 3 tiles, 500% damage in 3x3 area',     5.00),
+        ('Peas',         'Consumable', 'Regain 200 health',                          30.00),
+        ('Banana',       'Consumable', 'Regain 400 health',                          15.00),
+        ('Grapes',       'Consumable', 'Invincibility for 5 seconds',                 5.00),
+        ('Watermelon',   'Consumable', 'Regain 1000 health',                          5.00);
+
+    --Items in all location states
+    INSERT INTO dbo.Item (ItemTypeID, HolderPlayerID) VALUES (1, 2);        --bat held by player
+    INSERT INTO dbo.Item (ItemTypeID, NestID)         VALUES (3, 1);        --shield stored in player's nest
+    INSERT INTO dbo.Item (ItemTypeID, NestID)         VALUES (5, 1);        --peas stored in player's nest
+    INSERT INTO dbo.Item (ItemTypeID, TileID)         VALUES (8, 19);       --watermelon lying on a tile
+    INSERT INTO dbo.Item (ItemTypeID, TileID, Ammo)   VALUES (2, 6, 7);     --pellet gun on a tile with ammo
+    
+    --NPC
+    INSERT INTO dbo.NPC (TileID, Health, MaxHealth, IsAlive) VALUES (11, 1000, 1000, 1);
+
+    --chat messages
+    INSERT INTO dbo.ChatMessage (SenderPlayerID, MessageText)
+    VALUES (2, 'yoooo whats up guys????');
+    INSERT INTO dbo.ChatMessage (SenderPlayerID, MessageText)
+    VALUES (3, 'WATCH OUT HES GOT A PELLET GUN');
+
 END
 GO
+
 
 --procedure to build the database and populate test data
 EXEC dbo.usp_CreateGooseFighterDatabase;
