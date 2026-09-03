@@ -6,7 +6,7 @@ GO
 
 --called by LoginDao.AttemptLogin()
 CREATE OR ALTER PROCEDURE dbo.usp_TestLogin
-    @Username VARCHAR(50),
+    @Username VARCHAR(100),
     @Password VARCHAR(100)
 AS
 BEGIN
@@ -24,8 +24,6 @@ CREATE OR ALTER PROCEDURE dbo.usp_TestMovePlayer
     @NewTileID INT
 AS
 BEGIN
-    SET NOCOUNT ON;
-
     UPDATE dbo.Player
     SET CurrentTileID = @NewTileID
     WHERE PlayerID = @PlayerID;
@@ -34,13 +32,12 @@ GO
 
 --Called by AdminDao.AddPlayer()
 CREATE OR ALTER PROCEDURE dbo.usp_TestAddPlayer
-    @Email VARCHAR(100),
-    @Username VARCHAR(50),
+    @Email VARCHAR(255),
+    @Username VARCHAR(100),
     @Password VARCHAR(100),
     @IsAdmin BIT
 AS
 BEGIN
-    SET NOCOUNT ON;
 
     INSERT INTO dbo.Player (Email, Username, Password, IsAdmin)
     VALUES (@Email, @Username, @Password, @IsAdmin);
