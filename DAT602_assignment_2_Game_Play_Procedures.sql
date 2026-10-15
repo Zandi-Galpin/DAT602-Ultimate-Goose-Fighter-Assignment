@@ -267,3 +267,100 @@ EXEC dbo.usp_RemoveItemFromTile @TileID = 20; --SUCCESS (removes the banana)
 EXEC dbo.usp_RemoveItemFromTile @TileID = 20; --NO_ITEM (already gone)
 SELECT ItemID, ItemTypeID, TileID, Ammo FROM dbo.Item WHERE TileID = 21; --confirm ammo is between 3 and 10
 GO
+
+/* ------------------------------------------------------------
+   CRUD Process 5: Player game play movement (existing tiles only).
+   The game is played with arrow keys or wasd, so the caller passes a
+   direction rather than a tile. The database works out the target
+   tile and decides whether the move is allowed. Current coords are X and Y, so
+   UP = Y - 1, DOWN = Y + 1, LEFT = X - 1, RIGHT = X + 1.
+   Result set has NewTileID, NewX, NewY, MoveStatus.
+   ------------------------------------------------------------ */
+CREATE OR ALTER PROCEDURE dbo.usp_MovePlayer
+    @PlayerID  INT,
+    @Direction VARCHAR(10)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    IF @Direction IS NULL OR @Direction NOT IN ('UP', 'DOWN', 'LEFT', 'RIGHT')
+    BEGIN
+        SELECT NULL AS NewTileID, NULL AS NewX, NULL AS NewY, 'INVALID_DIRECTION' AS MoveStatus;
+        RETURN;
+    END
+
+    IF NOT EXISTS (SELECT 1 FROM dbo.Player WHERE PlayerID = @PlayerID)
+    BEGIN
+        SELECT NULL AS NewTileID, NULL AS NewX, NULL AS NewY, 'PLAYER_NOT_FOUND' AS MoveStatus;
+        RETURN;
+    END
+
+    DECLARE @IsOnline BIT, @CurrentTileID INT;
+    SELECT @IsOnline = IsOnline, @CurrentTileID = CurrentTileID
+    FROM dbo.Player
+    WHERE PlayerID = @PlayerID;
+
+    IF @IsOnline = 0
+    BEGIN
+        SELECT NULL AS NewTileID, NULL AS NewX, NULL AS NewY, 'NOT_ONLINE' AS MoveStatus;
+        RETURN;
+    END
+
+    IF @CurrentTileID IS NULL
+    BEGIN
+        SELECT NULL AS NewTileID, NULL AS NewX, NULL AS NewY, 'NO_CURRENT_TILE' AS MoveStatus;
+        RETURN;
+    END
+
+    --make the direction into a step from the position on the grid
+    DECLARE @DX INT = CASE @Direction WHEN 'LEFT' THEN -1 WHEN 'RIGHT' THEN 1 ELSE 0 END;
+    DECLARE @DY INT = CASE @Direction WHEN 'UP'   THEN -1 WHEN 'DOWN'  THEN 1 ELSE 0 END;
+
+    --find the specific the tile which is the specific step from before away from the player's current tile
+    DECLARE @TargetTileID INT, @NewX INT, @NewY INT;
+    SELECT @TargetTileID = t2.TileID, @NewX = t2.XPosition, @NewY = t2.YPosition
+    FROM dbo.Tile t1
+    JOIN dbo.Tile t2 ON t2.XPosition = t1.XPosition + @DX AND t2.YPosition = t1.YPosition + @DY
+    WHERE t1.TileID = @CurrentTileID;
+
+    --no tile there (not on board)
+    IF @TargetTileID IS NULL
+    BEGIN
+        SELECT NULL AS NewTileID, NULL AS NewX, NULL AS NewY, 'OFF_BOARD' AS MoveStatus;
+        RETURN;
+    END
+
+    --only one player per tile, but offline players don't count, they are not
+    --on the map until they log back in. the npc also blocks the tile.
+    IF EXISTS (SELECT 1 FROM dbo.Player WHERE CurrentTileID = @TargetTileID AND IsOnline = 1 AND PlayerID <> @PlayerID)
+       OR EXISTS (SELECT 1 FROM dbo.NPC WHERE TileID = @TargetTileID AND IsAlive = 1)
+    BEGIN
+        SELECT NULL AS NewTileID, NULL AS NewX, NULL AS NewY, 'TILE_OCCUPIED' AS MoveStatus;
+        RETURN;
+    END
+
+    UPDATE dbo.Player SET CurrentTileID = @TargetTileID WHERE PlayerID = @PlayerID;
+
+    SELECT @TargetTileID AS NewTileID, @NewX AS NewX, @NewY AS NewY, 'SUCCESS' AS MoveStatus;
+END
+GO
+
+--test calls    
+--initial positions are ZandiGoose (PlayerID 2) being online on tile 13 (2,2).
+EXEC dbo.usp_MovePlayer @PlayerID = 2, @Direction = 'UP'; --SUCCESS: tile 12 (2,1)
+EXEC dbo.usp_MovePlayer @PlayerID = 2, @Direction = 'UP'; --TILE_OCCUPIED: the NPC is on tile 11 (2,0)
+EXEC dbo.usp_MovePlayer @PlayerID = 2, @Direction = 'LEFT'; --SUCCESS: tile 7 = (1,1); a player is there but offline so it doesn't stop it
+
+--test setup, McPlayer (PlayerID 3) online on tile 8 (1,2)
+UPDATE dbo.Player SET IsOnline = 1, CurrentTileID = 8 WHERE PlayerID = 3;
+
+EXEC dbo.usp_MovePlayer @PlayerID = 2, @Direction = 'DOWN'; --TILE_OCCUPIED: McPlayer is online on tile 8
+EXEC dbo.usp_MovePlayer @PlayerID = 2, @Direction = 'UP'; --SUCCESS: tile 6 (1,0), item on tile doesnt stop movement
+EXEC dbo.usp_MovePlayer @PlayerID = 2, @Direction = 'LEFT'; --SUCCESS: tile 1 (0,0)
+EXEC dbo.usp_MovePlayer @PlayerID = 2, @Direction = 'LEFT'; --OFF_BOARD: nothing at(-1,0)
+EXEC dbo.usp_MovePlayer @PlayerID = 2, @Direction = 'SKIBIDI'; --INVALID_DIRECTION
+EXEC dbo.usp_MovePlayer @PlayerID = 991, @Direction = 'UP'; --PLAYER_NOT_FOUND
+EXEC dbo.usp_MovePlayer @PlayerID = 5, @Direction = 'UP'; --NOT_ONLINE 
+EXEC dbo.usp_MovePlayer @PlayerID = 6, @Direction = 'UP'; --NO_CURRENT_TILE (player made by the registration test)
+GO
+
