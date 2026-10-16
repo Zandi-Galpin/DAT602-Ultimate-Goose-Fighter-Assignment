@@ -89,6 +89,15 @@ AS
 BEGIN
     SET NOCOUNT ON;
 
+    --all 3 fields are needed (the button does nothing if one is empty)
+    IF LTRIM(RTRIM(ISNULL(@Email, ''))) = ''
+       OR LTRIM(RTRIM(ISNULL(@Username, ''))) = ''
+       OR ISNULL(@Password, '') = ''
+    BEGIN
+        SELECT CAST(NULL AS INT) AS PlayerID, 'MISSING_FIELDS' AS RegisterStatus;
+        RETURN;
+    END
+
     IF EXISTS (SELECT 1 FROM dbo.Player WHERE Username = @Username)
     BEGIN
         SELECT CAST(NULL AS INT) AS PlayerID, 'USERNAME_TAKEN' AS RegisterStatus;
@@ -115,6 +124,7 @@ GO
 EXEC dbo.usp_RegisterPlayer @Email = 'newguyforreal@example.com', @Username = 'NewPlayer1', @Password = 'Passwooord!1'; --SUCCESS
 EXEC dbo.usp_RegisterPlayer @Email = 'another@example.com', @Username = 'ZandiGoose', @Password = 'Passwoooadsfafrd!2'; --USERNAME_TAKEN
 EXEC dbo.usp_RegisterPlayer @Email = 'zandi@example.com', @Username = 'SkibidiPlayer', @Password = 'Password1!'; --EMAIL_TAKEN
+EXEC dbo.usp_RegisterPlayer @Email = '', @Username = 'NoEmailGoose', @Password = 'Passw0rd!'; --MISSING_FIELDS
 GO
 
 /* ------------------------------------------------------------
@@ -230,7 +240,7 @@ BEGIN
     --pellet guns start with random 3-10 ammo, everything else has none
     DECLARE @Ammo INT = NULL;
     IF EXISTS (SELECT 1 FROM dbo.ItemType WHERE ItemTypeID = @ItemTypeID AND Name = 'Pellet Gun')
-        SET @Ammo = (ABS(CHECKSUM(NEWID())) % 8) + 3;
+        SET @Ammo = ABS(CHECKSUM(NEWID()) % 8) + 3;
 
     INSERT INTO dbo.Item (ItemTypeID, TileID, Ammo)
     VALUES (@ItemTypeID, @TileID, @Ammo);
@@ -501,7 +511,23 @@ BEGIN
         SELECT 'NOTHING_THERE' AS AttackStatus, NULL AS DamageDealt, NULL AS VictimPlayerID, NULL AS VictimHealth, NULL AS AttackerScore;
         RETURN;
     END
- 
+    
+    --the attacker's damage multiplier comes from the item in their beak
+    DECLARE @OutMult DECIMAL(4,2) = 1.00;
+
+    IF EXISTS (SELECT 1 FROM dbo.Item i JOIN dbo.ItemType it ON it.ItemTypeID = i.ItemTypeID
+               WHERE i.HolderPlayerID = @AttackerID AND it.Name = 'Baseball Bat')
+    BEGIN
+        SET @OutMult = 1.50;
+    END
+    ELSE IF EXISTS (SELECT 1 FROM dbo.Item i JOIN dbo.ItemType it ON it.ItemTypeID = i.ItemTypeID
+                    WHERE i.HolderPlayerID = @AttackerID AND it.Name = 'Shield')
+    BEGIN
+        SET @OutMult = 0.75;
+    END
+
+    --who is standing on that tile? (online, non admins only)
+
     --who is standing on that tile? (online, non admins only)
     --invincibility counts only while active. (InvincibleUntil)
     --NULL means invincible until changed state (e.g. in the settings screen).
@@ -516,11 +542,26 @@ BEGIN
  
     IF @VictimID IS NULL
     BEGIN
-        --no player there. If it's the NPC, the NPC procedure (process 8) handles it.
-        IF EXISTS (SELECT 1 FROM dbo.NPC WHERE TileID = @TargetTileID AND IsAlive = 1)
-            SELECT 'NPC_IN_FRONT' AS AttackStatus, NULL AS DamageDealt, NULL AS VictimPlayerID, NULL AS VictimHealth, NULL AS AttackerScore;
-        ELSE
+        --no player there, check is it the npc??? 
+        DECLARE @NpcID INT, @NpcDamage INT, @NpcHealthLeft INT, @NpcKilled BIT;
+        SELECT @NpcID = NPCID FROM dbo.NPC WHERE TileID = @TargetTileID AND IsAlive = 1;
+
+        IF @NpcID IS NULL
+        BEGIN
             SELECT 'NOTHING_THERE' AS AttackStatus, NULL AS DamageDealt, NULL AS VictimPlayerID, NULL AS VictimHealth, NULL AS AttackerScore;
+            RETURN;
+        END
+
+        --the NPC has no items so only the attacker's multiplier counts. other checks not needed
+        --hitting the npc doesnt gives score.
+        SET @NpcDamage = CAST(ROUND(@BaseDamage * @OutMult, 0) AS INT);
+        EXEC dbo.usp_DamageNpc @NpcID = @NpcID, @Damage = @NpcDamage,
+                               @NpcHealthLeft = @NpcHealthLeft OUTPUT, @NpcKilled = @NpcKilled OUTPUT;
+
+        --for npc results, VictimHealth is the npcs remaining health
+        SELECT CASE WHEN @NpcKilled = 1 THEN 'NPC_KILLED' ELSE 'NPC_HIT' END AS AttackStatus,
+               @NpcDamage AS DamageDealt, NULL AS VictimPlayerID, @NpcHealthLeft AS VictimHealth,
+               (SELECT Score FROM dbo.Player WHERE PlayerID = @AttackerID) AS AttackerScore;
         RETURN;
     END
  
@@ -537,20 +578,8 @@ BEGIN
         RETURN;
     END
  
-    --damage, base value gets changed by the attacker's and the defender's items
-    DECLARE @OutMult DECIMAL(4,2) = 1.00;
+    --damage against a player is the attacker's multiplier times the defenders
     DECLARE @InMult  DECIMAL(4,2) = 1.00;
- 
-    IF EXISTS (SELECT 1 FROM dbo.Item i JOIN dbo.ItemType it ON it.ItemTypeID = i.ItemTypeID
-               WHERE i.HolderPlayerID = @AttackerID AND it.Name = 'Baseball Bat')
-    BEGIN
-        SET @OutMult = 1.50;
-    END
-    ELSE IF EXISTS (SELECT 1 FROM dbo.Item i JOIN dbo.ItemType it ON it.ItemTypeID = i.ItemTypeID
-                    WHERE i.HolderPlayerID = @AttackerID AND it.Name = 'Shield')
-    BEGIN
-        SET @OutMult = 0.75;
-    END
  
     IF EXISTS (SELECT 1 FROM dbo.Item i JOIN dbo.ItemType it ON it.ItemTypeID = i.ItemTypeID
                WHERE i.HolderPlayerID = @VictimID AND it.Name = 'Shield')
@@ -636,7 +665,7 @@ SELECT NestID, PlayerID, TileID FROM dbo.Nest; --McPlayer's old nest (tile 7) is
  
 --other scenarios
 UPDATE dbo.Player SET CurrentTileID = 12 WHERE PlayerID = 2;
-EXEC dbo.usp_Attack @AttackerID = 2, @Direction = 'UP'; --NPC_IN_FRONT: the NPC is on tile 11 (2,0)
+EXEC dbo.usp_Attack @AttackerID = 2, @Direction = 'UP'; --NPC_HIT: the NPC is on tile 11 (2,0), bat does 60 damage (health 1000 to 940), no score
 UPDATE dbo.Player SET CurrentTileID = 1 WHERE PlayerID = 2;
 EXEC dbo.usp_Attack @AttackerID = 2, @Direction = 'LEFT'; --NOTHING_THERE: edge of the board
 EXEC dbo.usp_Attack @AttackerID = 2, @Direction = 'SIDEWAYS'; --INVALID_DIRECTION
@@ -907,9 +936,22 @@ AS
 BEGIN
     SET NOCOUNT ON;
  
-    IF (SELECT COUNT(*) FROM dbo.Player WHERE IsOnline = 1 AND IsAdmin = 0) < 2
+    --how many items can be lying on the map for each online player
+    DECLARE @MaxItemsPerPlayer INT = 2;
+    DECLARE @OnlinePlayers INT = (SELECT COUNT(*) FROM dbo.Player WHERE IsOnline = 1 AND IsAdmin = 0);
+
+    --items only spawn while at least 2 players are online
+    IF @OnlinePlayers < 2
     BEGIN
         SELECT NULL AS ItemID, NULL AS TileID, NULL AS ItemTypeID, 'NOT_ENOUGH_PLAYERS' AS SpawnStatus;
+        RETURN;
+    END
+
+    --stop the map filling up with items. only items lying on tiles count
+    --(items in a beak or a nest dont), admin placed items count too.
+    IF (SELECT COUNT(*) FROM dbo.Item WHERE TileID IS NOT NULL) >= @OnlinePlayers * @MaxItemsPerPlayer
+    BEGIN
+        SELECT NULL AS ItemID, NULL AS TileID, NULL AS ItemTypeID, 'ITEM_LIMIT_REACHED' AS SpawnStatus;
         RETURN;
     END
  
@@ -964,6 +1006,8 @@ EXEC dbo.usp_SpawnRandomItem; --SUCCESS
 UPDATE dbo.Player SET IsOnline = 0 WHERE PlayerID = 3;
 EXEC dbo.usp_SpawnRandomItem; --NOT_ENOUGH_PLAYERS (only ZandiGoose online)
 UPDATE dbo.Player SET IsOnline = 1 WHERE PlayerID = 3;
+EXEC dbo.usp_SpawnRandomItem; --SUCCESS: the 4th item on the map, at the limit of 2 per online player
+EXEC dbo.usp_SpawnRandomItem; --ITEM_LIMIT_REACHED
 GO
  
 

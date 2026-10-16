@@ -206,13 +206,13 @@ BEGIN
 
     --item types: all 4 holdable + 4 consumable
     INSERT INTO dbo.ItemType (Name, Category, EffectDescription, SpawnRate) VALUES
-        ('Baseball Bat', 'Holdable',   '+50% attack damage',                         15.00),
-        ('Pellet Gun',   'Holdable',   '-50% attack damage, ranged, 3-10 ammo',      10.00),
-        ('Shield',       'Holdable',   '-50% incoming damage, -25% outgoing damage', 12.00),
-        ('Grenade',      'Holdable',   'Thrown 3 tiles, 500% damage in 3x3 area',     5.00),
+        ('Baseball Bat', 'Holdable',   '+50% attack damage',                         14.00),
+        ('Pellet Gun',   'Holdable',   '-50% attack damage, ranged, 3-10 ammo',      12.00),
+        ('Shield',       'Holdable',   '-50% incoming damage, -25% outgoing damage', 14.00),
+        ('Grenade',      'Holdable',   'Thrown 3 tiles, 500% damage in 3x3 area',     4.00),
         ('Peas',         'Consumable', 'Regain 200 health',                          30.00),
         ('Banana',       'Consumable', 'Regain 400 health',                          15.00),
-        ('Grapes',       'Consumable', 'Invincibility for 5 seconds',                 5.00),
+        ('Grapes',       'Consumable', 'Invincibility for 5 seconds',                 6.00),
         ('Watermelon',   'Consumable', 'Regain 1000 health',                          5.00);
 
     --Items in all location states
