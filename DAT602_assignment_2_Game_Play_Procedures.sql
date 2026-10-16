@@ -1099,3 +1099,306 @@ EXEC dbo.usp_RespawnNpc; --SUCCESS: back at full health on a random free tile
 EXEC dbo.usp_RespawnNpc; --ALREADY_ALIVE
 SELECT NPCID, TileID, Health, IsAlive, RespawnTime FROM dbo.NPC;
 GO
+
+/* ------------------------------------------------------------
+   CRUD Process 9: kill running games.
+   Admin button from storyboard 8
+   There is one shared map, so killing the running game means everyone currently
+   online is kicked except the admin who clicked it.
+   positions, health, scores and items arent changed, so its like a
+   normal logout for each player. permanent invincibility (settings screen)
+   is cleared so nobody comes back permanently invincible
+   ------------------------------------------------------------ */
+CREATE OR ALTER PROCEDURE dbo.usp_KillRunningGame
+    @AdminID INT
+AS
+BEGIN
+    SET NOCOUNT ON;
+ 
+    IF NOT EXISTS (SELECT 1 FROM dbo.Player WHERE PlayerID = @AdminID)
+    BEGIN
+        SELECT NULL AS PlayersLoggedOut, 'ADMIN_NOT_FOUND' AS KillStatus;
+        RETURN;
+    END
+ 
+    IF NOT EXISTS (SELECT 1 FROM dbo.Player WHERE PlayerID = @AdminID AND IsAdmin = 1)
+    BEGIN
+        SELECT NULL AS PlayersLoggedOut, 'NOT_ADMIN' AS KillStatus;
+        RETURN;
+    END
+ 
+    UPDATE dbo.Player
+    SET IsOnline = 0, IsInvincible = 0, InvincibleUntil = NULL
+    WHERE IsOnline = 1 AND PlayerID <> @AdminID;
+ 
+    DECLARE @LoggedOut INT = @@ROWCOUNT;
+ 
+    SELECT @LoggedOut AS PlayersLoggedOut, 'SUCCESS' AS KillStatus;
+END
+GO
+ 
+CREATE OR ALTER PROCEDURE dbo.usp_LogoutPlayer
+    @PlayerID INT
+AS
+BEGIN
+    SET NOCOUNT ON;
+ 
+    IF NOT EXISTS (SELECT 1 FROM dbo.Player WHERE PlayerID = @PlayerID)
+    BEGIN
+        SELECT 'PLAYER_NOT_FOUND' AS LogoutStatus;
+        RETURN;
+    END
+ 
+    UPDATE dbo.Player
+    SET IsOnline = 0, IsInvincible = 0, InvincibleUntil = NULL
+    WHERE PlayerID = @PlayerID;
+ 
+    SELECT 'SUCCESS' AS LogoutStatus;
+END
+GO
+ 
+--test calls
+UPDATE dbo.Player SET IsOnline = 1 WHERE PlayerID IN (1, 2, 3); --AdminGoose, ZandiGoose and McPlayer online
+ 
+EXEC dbo.usp_KillRunningGame @AdminID = 2; --NOT_ADMIN
+EXEC dbo.usp_KillRunningGame @AdminID = 999; --ADMIN_NOT_FOUND
+EXEC dbo.usp_KillRunningGame @AdminID = 1; --SUCCESS: everyone online except AdminGoose is logged out
+SELECT PlayerID, Username, IsOnline FROM dbo.Player; --only AdminGoose still online
+ 
+UPDATE dbo.Player SET IsOnline = 1, IsInvincible = 1, InvincibleUntil = NULL WHERE PlayerID = 2;
+EXEC dbo.usp_LogoutPlayer @PlayerID = 2; --SUCCESS: offline, invincibility cleared
+EXEC dbo.usp_LogoutPlayer @PlayerID = 999; --PLAYER_NOT_FOUND
+GO
+ 
+
+/* ------------------------------------------------------------
+   CRUD Process 10: Add new players (admin).
+   only an admin can do it, the admin
+   chooses whether the new player is an admin, and the new player starts
+   offline with no tile, so their first login takes them to a new player spawn
+   ------------------------------------------------------------ */
+CREATE OR ALTER PROCEDURE dbo.usp_AddPlayer
+    @AdminID INT,
+    @Email VARCHAR(255),
+    @Username VARCHAR(100),
+    @Password VARCHAR(100),
+    @IsAdmin BIT
+AS
+BEGIN
+    SET NOCOUNT ON;
+ 
+    IF NOT EXISTS (SELECT 1 FROM dbo.Player WHERE PlayerID = @AdminID)
+    BEGIN
+        SELECT NULL AS PlayerID, 'ADMIN_NOT_FOUND' AS AddPlayerStatus;
+        RETURN;
+    END
+ 
+    IF NOT EXISTS (SELECT 1 FROM dbo.Player WHERE PlayerID = @AdminID AND IsAdmin = 1)
+    BEGIN
+        SELECT NULL AS PlayerID, 'NOT_ADMIN' AS AddPlayerStatus;
+        RETURN;
+    END
+ 
+    IF LTRIM(RTRIM(ISNULL(@Email, ''))) = ''
+       OR LTRIM(RTRIM(ISNULL(@Username, ''))) = ''
+       OR ISNULL(@Password, '') = ''
+       OR @IsAdmin IS NULL
+    BEGIN
+        SELECT NULL AS PlayerID, 'MISSING_FIELDS' AS AddPlayerStatus;
+        RETURN;
+    END
+ 
+    IF EXISTS (SELECT 1 FROM dbo.Player WHERE Username = @Username)
+    BEGIN
+        SELECT NULL AS PlayerID, 'USERNAME_TAKEN' AS AddPlayerStatus;
+        RETURN;
+    END
+ 
+    IF EXISTS (SELECT 1 FROM dbo.Player WHERE Email = @Email)
+    BEGIN
+        SELECT NULL AS PlayerID, 'EMAIL_TAKEN' AS AddPlayerStatus;
+        RETURN;
+    END
+ 
+    INSERT INTO dbo.Player (Email, Username, Password, IsAdmin)
+    VALUES (@Email, @Username, @Password, @IsAdmin);
+ 
+    SELECT SCOPE_IDENTITY() AS PlayerID, 'SUCCESS' AS AddPlayerStatus;
+END
+GO
+ 
+--test calls
+EXEC dbo.usp_AddPlayer @AdminID = 1, @Email = 'secondadmin@example.com', @Username = 'SecondAdmin', @Password = 'AdminPassword4asd56!', @IsAdmin = 1; --SUCCESS (new admin)
+EXEC dbo.usp_AddPlayer @AdminID = 1, @Email = 'yes@example.com', @Username = 'YesGoose', @Password = 'sadfAsdfas@3!', @IsAdmin = 0; --SUCCESS (regular player)
+EXEC dbo.usp_AddPlayer @AdminID = 1, @Email = 'yesyes@example.com', @Username = 'ZandiGoose', @Password = 'SkiBidi1!', @IsAdmin = 0; --USERNAME_TAKEN
+EXEC dbo.usp_AddPlayer @AdminID = 1, @Email = 'zandi@example.com', @Username = 'DinGoose', @Password = 'chungus12A!', @IsAdmin = 0; --EMAIL_TAKEN
+EXEC dbo.usp_AddPlayer @AdminID = 1, @Email = 'what@example.com', @Username = '', @Password = 'adsfasdf1A!', @IsAdmin = 0; --MISSING_FIELDS
+EXEC dbo.usp_AddPlayer @AdminID = 2, @Email = 'sneaky@example.com', @Username = 'SneakyGoose', @Password = 'asdfasdfA1!', @IsAdmin = 0; --NOT_ADMIN
+EXEC dbo.usp_AddPlayer @AdminID = 999, @Email = 'ghost@example.com', @Username = 'GhostGoose', @Password = 'asdfasdfA2!', @IsAdmin = 0; --ADMIN_NOT_FOUND
+GO
+ 
+/* ------------------------------------------------------------
+   CRUD Process 11: Update data of a player (admin).
+   Edits email, username, password, score, admin flag and locked flag.
+   Unlocking an account resets FailedLoginAttempts to 0
+   ------------------------------------------------------------ */
+CREATE OR ALTER PROCEDURE dbo.usp_UpdatePlayer
+    @AdminID INT,
+    @PlayerID INT,
+    @Email VARCHAR(255),
+    @Username VARCHAR(100),
+    @Password VARCHAR(100),
+    @Score INT,
+    @IsAdmin BIT,
+    @IsLockedOut BIT
+AS
+BEGIN
+    SET NOCOUNT ON;
+ 
+    IF NOT EXISTS (SELECT 1 FROM dbo.Player WHERE PlayerID = @AdminID)
+    BEGIN
+        SELECT NULL AS PlayerID, 'ADMIN_NOT_FOUND' AS UpdatePlayerStatus;
+        RETURN;
+    END
+ 
+    IF NOT EXISTS (SELECT 1 FROM dbo.Player WHERE PlayerID = @AdminID AND IsAdmin = 1)
+    BEGIN
+        SELECT NULL AS PlayerID, 'NOT_ADMIN' AS UpdatePlayerStatus;
+        RETURN;
+    END
+ 
+    IF NOT EXISTS (SELECT 1 FROM dbo.Player WHERE PlayerID = @PlayerID)
+    BEGIN
+        SELECT NULL AS PlayerID, 'PLAYER_NOT_FOUND' AS UpdatePlayerStatus;
+        RETURN;
+    END
+ 
+    IF LTRIM(RTRIM(ISNULL(@Email, ''))) = ''
+       OR LTRIM(RTRIM(ISNULL(@Username, ''))) = ''
+       OR ISNULL(@Password, '') = ''
+       OR @Score IS NULL OR @IsAdmin IS NULL OR @IsLockedOut IS NULL
+    BEGIN
+        SELECT NULL AS PlayerID, 'MISSING_FIELDS' AS UpdatePlayerStatus;
+        RETURN;
+    END
+ 
+    IF @Score < 0
+    BEGIN
+        SELECT NULL AS PlayerID, 'INVALID_SCORE' AS UpdatePlayerStatus;
+        RETURN;
+    END
+ 
+    --username and email need to be unique, ignores the player being edited
+    IF EXISTS (SELECT 1 FROM dbo.Player WHERE Username = @Username AND PlayerID <> @PlayerID)
+    BEGIN
+        SELECT NULL AS PlayerID, 'USERNAME_TAKEN' AS UpdatePlayerStatus;
+        RETURN;
+    END
+ 
+    IF EXISTS (SELECT 1 FROM dbo.Player WHERE Email = @Email AND PlayerID <> @PlayerID)
+    BEGIN
+        SELECT NULL AS PlayerID, 'EMAIL_TAKEN' AS UpdatePlayerStatus;
+        RETURN;
+    END
+ 
+    UPDATE dbo.Player
+    SET Email = @Email,
+        Username = @Username,
+        Password = @Password,
+        Score = @Score,
+        IsAdmin = @IsAdmin,
+        IsLockedOut = @IsLockedOut,
+        FailedLoginAttempts = CASE WHEN @IsLockedOut = 0 THEN 0 ELSE FailedLoginAttempts END
+    WHERE PlayerID = @PlayerID;
+ 
+    SELECT @PlayerID AS PlayerID, 'SUCCESS' AS UpdatePlayerStatus;
+END
+GO
+ 
+--test calls
+--rename McPlayer (PlayerID 3) and change their email
+EXEC dbo.usp_UpdatePlayer @AdminID = 1, @PlayerID = 3, @Email = 'mcplayer2@example.com', @Username = 'Mcplayerington Two',
+                          @Password = 'Passw0rd!', @Score = 5, @IsAdmin = 0, @IsLockedOut = 0; --SUCCESS
+ 
+--unlock LockedGoose (PlayerID 4), their stored password is 'wrongpass', so they can then log in
+EXEC dbo.usp_UpdatePlayer @AdminID = 1, @PlayerID = 4, @Email = 'lockedout@example.com', @Username = 'LockedGoose',
+                          @Password = 'wrongpass', @Score = 0, @IsAdmin = 0, @IsLockedOut = 0; --SUCCESS
+EXEC dbo.usp_LoginPlayer @Username = 'LockedGoose', @Password = 'wrongpass'; --SUCCESS (was LOCKED_OUT before)
+ 
+EXEC dbo.usp_UpdatePlayer @AdminID = 1, @PlayerID = 3, @Email = 'mcplayer2@example.com', @Username = 'ZandiGoose',
+                          @Password = 'Passw0rd!', @Score = 5, @IsAdmin = 0, @IsLockedOut = 0; --USERNAME_TAKEN
+EXEC dbo.usp_UpdatePlayer @AdminID = 1, @PlayerID = 3, @Email = 'zandi@example.com', @Username = 'Mcplayerington Two',
+                          @Password = 'Passw0rd!', @Score = 5, @IsAdmin = 0, @IsLockedOut = 0; --EMAIL_TAKEN
+EXEC dbo.usp_UpdatePlayer @AdminID = 1, @PlayerID = 3, @Email = 'mcplayer2@example.com', @Username = 'Mcplayerington Two',
+                          @Password = 'Passw0rd!', @Score = -5, @IsAdmin = 0, @IsLockedOut = 0; --INVALID_SCORE
+EXEC dbo.usp_UpdatePlayer @AdminID = 1, @PlayerID = 3, @Email = 'mcplayer2@example.com', @Username = '',
+                          @Password = 'Passw0rd!', @Score = 5, @IsAdmin = 0, @IsLockedOut = 0; --MISSING_FIELDS
+EXEC dbo.usp_UpdatePlayer @AdminID = 1, @PlayerID = 999, @Email = 'x@example.com', @Username = 'X',
+                          @Password = 'x', @Score = 0, @IsAdmin = 0, @IsLockedOut = 0; --PLAYER_NOT_FOUND
+EXEC dbo.usp_UpdatePlayer @AdminID = 2, @PlayerID = 3, @Email = 'mcplayer2@example.com', @Username = 'Mcplayerington Two',
+                          @Password = 'Passw0rd!', @Score = 5, @IsAdmin = 0, @IsLockedOut = 0; --NOT_ADMIN
+SELECT PlayerID, Username, Email, Score, IsAdmin, IsLockedOut, FailedLoginAttempts FROM dbo.Player;
+GO
+ 
+ 
+/* ------------------------------------------------------------
+   CRUD Process 12: Delete a player.
+   A player can delete their own account and an admin can
+   delete any player. The foreign keys on Item are
+   NO ACTION so this deletes the
+   items itself, first. Deleting the player then removes their
+   nest and chat messages automatically (CASCADE).
+   ------------------------------------------------------------ */
+CREATE OR ALTER PROCEDURE dbo.usp_DeletePlayer
+    @RequesterID INT,
+    @PlayerID INT
+AS
+BEGIN
+    SET NOCOUNT ON;
+ 
+    IF NOT EXISTS (SELECT 1 FROM dbo.Player WHERE PlayerID = @RequesterID)
+    BEGIN
+        SELECT 'REQUESTER_NOT_FOUND' AS DeletePlayerStatus;
+        RETURN;
+    END
+ 
+    IF NOT EXISTS (SELECT 1 FROM dbo.Player WHERE PlayerID = @PlayerID)
+    BEGIN
+        SELECT 'PLAYER_NOT_FOUND' AS DeletePlayerStatus;
+        RETURN;
+    END
+ 
+    --only the account's owner or an admin may delete it
+    IF @RequesterID <> @PlayerID
+       AND NOT EXISTS (SELECT 1 FROM dbo.Player WHERE PlayerID = @RequesterID AND IsAdmin = 1)
+    BEGIN
+        SELECT 'NOT_AUTHORISED' AS DeletePlayerStatus;
+        RETURN;
+    END
+ 
+    --the player's items, the one in their beak and everything in their nest
+    DELETE FROM dbo.Item
+    WHERE HolderPlayerID = @PlayerID
+       OR NestID IN (SELECT NestID FROM dbo.Nest WHERE PlayerID = @PlayerID);
+ 
+    --The player (their nest and chat messages cascade)
+    DELETE FROM dbo.Player WHERE PlayerID = @PlayerID;
+ 
+    SELECT 'SUCCESS' AS DeletePlayerStatus;
+END
+GO
+ 
+--test calls
+EXEC dbo.usp_DeletePlayer @RequesterID = 4,   @PlayerID = 5; --NOT_AUTHORISED: a regular player can't delete someone else
+EXEC dbo.usp_DeletePlayer @RequesterID = 999, @PlayerID = 5; --REQUESTER_NOT_FOUND
+EXEC dbo.usp_DeletePlayer @RequesterID = 1,   @PlayerID = 999; --PLAYER_NOT_FOUND
+EXEC dbo.usp_DeletePlayer @RequesterID = 1,   @PlayerID = 3; --SUCCESS: admin deletes McPlayer
+EXEC dbo.usp_DeletePlayer @RequesterID = 2,   @PlayerID = 2; --SUCCESS: ZandiGoose deletes his own account
+ 
+SELECT PlayerID, Username FROM dbo.Player; --players 2 and 3 are gone
+SELECT NestID, PlayerID, TileID FROM dbo.Nest; --no nests left for them
+SELECT ItemID, ItemTypeID, TileID, HolderPlayerID, NestID FROM dbo.Item; --only items lying on tiles 
+SELECT MessageID, SenderPlayerID FROM dbo.ChatMessage; --chat messages are gone
+GO
+ 
+
