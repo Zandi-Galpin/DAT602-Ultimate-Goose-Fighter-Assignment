@@ -48,6 +48,11 @@
   </ItemGroup>
   <ItemGroup>
     <Compile Include="AdminDao.cs" />
+    <Compile Include="BaseDao.cs" />
+    <Compile Include="DaoTestForm.cs">
+      <SubType>Form</SubType>
+    </Compile>
+    <Compile Include="DaoTests.cs" />
     <Compile Include="AdminForm.cs">
       <SubType>Form</SubType>
     </Compile>

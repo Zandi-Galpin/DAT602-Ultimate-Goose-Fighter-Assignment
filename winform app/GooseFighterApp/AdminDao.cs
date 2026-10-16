@@ -1,26 +1,123 @@
+using System;
 using System.Data;
 using System.Data.SqlClient;
 
 namespace GooseFighterApp
 {
-    public class AdminDao
+    public class AdminDao : BaseDao
     {
-        private readonly DatabaseConnection _dbConnection = new DatabaseConnection();
+        /// <summary>
+        /// crud 3. Calls usp_PlaceTile. Result contains TileID, PlaceTileStatus
+        /// (which is SUCCESS, TILE_EXISTS or NOT_ADJACENT).
+        /// </summary>
+        public DataTable PlaceTile(int x, int y)
+        {
+            return ExecuteProcedure("dbo.usp_PlaceTile",
+                Param("@XPosition", SqlDbType.Int, x),
+                Param("@YPosition", SqlDbType.Int, y));
+        }
 
         /// <summary>
-        /// Calls usp_TestAddPlayer, which inserts a new PLAYER row,
-        /// the same thing the "Add new player" admin screen will do.
+        /// CRUD 3. Calls usp_DeleteTile. Result contains: DeleteTileStatus
+        /// (which is SUCCESS, TILE_NOT_FOUND or TILE_IN_USE).
         /// </summary>
+        public DataTable DeleteTile(int tileId)
+        {
+            return ExecuteProcedure("dbo.usp_DeleteTile",
+                Param("@TileID", SqlDbType.Int, tileId));
+        }
+
+        /// <summary>
+        /// crud 4 calls usp_PlaceItem. Result containss ItemID, PlaceItemStatus
+        /// (which is SUCCESS, ITEMTYPE_NOT_FOUND, TILE_NOT_FOUND or TILE_HAS_ITEM).
+        /// </summary>
+        public DataTable PlaceItem(int itemTypeId, int tileId)
+        {
+            return ExecuteProcedure("dbo.usp_PlaceItem",
+                Param("@ItemTypeID", SqlDbType.Int, itemTypeId),
+                Param("@TileID", SqlDbType.Int, tileId));
+        }
+
+        /// <summary>
+        /// crud 4. Calls usp_RemoveItemFromTile (rubbish bin tool).
+        /// Result contains RemoveItemStatus (SUCCESS or NO_ITEM).
+        /// </summary>
+        public DataTable RemoveItemFromTile(int tileId)
+        {
+            return ExecuteProcedure("dbo.usp_RemoveItemFromTile",
+                Param("@TileID", SqlDbType.Int, tileId));
+        }
+
+        /// <summary>
+        /// CRUD 9 calls usp_KillRunningGame. Result contains PlayersLoggedOut, KillStatus
+        /// (which is SUCCESS, ADMIN_NOT_FOUND or NOT_ADMIN).
+        /// </summary>
+        public DataTable KillRunningGame(int adminId)
+        {
+            return ExecuteProcedure("dbo.usp_KillRunningGame",
+                Param("@AdminID", SqlDbType.Int, adminId));
+        }
+
+        /// <summary>
+        /// CRUD 10 calls usp_AddPlayer. Result has PlayerID, AddPlayerStatus
+        /// (has SUCCESS, ADMIN_NOT_FOUND, NOT_ADMIN, MISSING_FIELDS, USERNAME_TAKEN or EMAIL_TAKEN).
+        /// </summary>
+        public DataTable AddPlayer(int adminId, string email, string username, string password, bool isAdmin)
+        {
+            return ExecuteProcedure("dbo.usp_AddPlayer",
+                Param("@AdminID", SqlDbType.Int, adminId),
+                Param("@Email", SqlDbType.VarChar, email),
+                Param("@Username", SqlDbType.VarChar, username),
+                Param("@Password", SqlDbType.VarChar, password),
+                Param("@IsAdmin", SqlDbType.Bit, isAdmin));
+        }
+
+        /// <summary>
+        /// CRUD 11 calls usp_UpdatePlayer. Result has PlayerID, UpdatePlayerStatus
+        /// (has SUCCESS, ADMIN_NOT_FOUND, NOT_ADMIN, PLAYER_NOT_FOUND, MISSING_FIELDS,
+        /// INVALID_SCORE, USERNAME_TAKEN or EMAIL_TAKEN).
+        /// </summary>
+        public DataTable UpdatePlayer(int adminId, int playerId, string email, string username,
+                                      string password, int score, bool isAdmin, bool isLockedOut)
+        {
+            return ExecuteProcedure("dbo.usp_UpdatePlayer",
+                Param("@AdminID", SqlDbType.Int, adminId),
+                Param("@PlayerID", SqlDbType.Int, playerId),
+                Param("@Email", SqlDbType.VarChar, email),
+                Param("@Username", SqlDbType.VarChar, username),
+                Param("@Password", SqlDbType.VarChar, password),
+                Param("@Score", SqlDbType.Int, score),
+                Param("@IsAdmin", SqlDbType.Bit, isAdmin),
+                Param("@IsLockedOut", SqlDbType.Bit, isLockedOut));
+        }
+
+        /// <summary>
+        /// CRUD 12 calls usp_DeletePlayer. A player deleting their account passes
+        /// their ID as both arguments. Result has DeletePlayerStatus (has SUCCESS,
+        /// REQUESTER_NOT_FOUND, PLAYER_NOT_FOUND or NOT_AUTHORISED).
+        /// </summary>
+        public DataTable DeletePlayer(int requesterId, int playerId)
+        {
+            return ExecuteProcedure("dbo.usp_DeletePlayer",
+                Param("@RequesterID", SqlDbType.Int, requesterId),
+                Param("@PlayerID", SqlDbType.Int, playerId));
+        }
+
+        /// <summary>
+        /// old method (usp_TestAddPlayer, no admin check).
+        /// AdminForm still calls this until i switched
+        /// </summary>
+        [Obsolete("Replaced by AddPlayer(adminId, ...). Delete once AdminForm is updated.")]
         public int AddPlayer(string email, string username, string password, bool isAdmin)
         {
             using (SqlConnection connection = _dbConnection.GetConnection())
             using (SqlCommand command = new SqlCommand("dbo.usp_TestAddPlayer", connection))
             {
                 command.CommandType = CommandType.StoredProcedure;
-                command.Parameters.AddWithValue("@Email", email);
-                command.Parameters.AddWithValue("@Username", username);
-                command.Parameters.AddWithValue("@Password", password);
-                command.Parameters.AddWithValue("@IsAdmin", isAdmin);
+                command.Parameters.Add(Param("@Email", SqlDbType.VarChar, email));
+                command.Parameters.Add(Param("@Username", SqlDbType.VarChar, username));
+                command.Parameters.Add(Param("@Password", SqlDbType.VarChar, password));
+                command.Parameters.Add(Param("@IsAdmin", SqlDbType.Bit, isAdmin));
 
                 connection.Open();
                 return command.ExecuteNonQuery();
