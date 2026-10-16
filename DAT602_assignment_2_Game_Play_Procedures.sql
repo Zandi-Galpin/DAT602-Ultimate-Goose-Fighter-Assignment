@@ -364,3 +364,473 @@ EXEC dbo.usp_MovePlayer @PlayerID = 5, @Direction = 'UP'; --NOT_ONLINE
 EXEC dbo.usp_MovePlayer @PlayerID = 6, @Direction = 'UP'; --NO_CURRENT_TILE (player made by the registration test)
 GO
 
+
+
+/* ------------------------------------------------------------
+   CRUD Process 6: Gameplay scoring.
+   Players get 1 point for defeating another player
+   nobody ever loses score, and defeating the NPC doesnt give score.
+   An attack hits the tile in front of the attacker, so the
+   caller passes the direction the goose is facing
+   Damage: 40, or x1.5 with a Baseball Bat, x0.75 with a Shield, 
+   and x0.5 if the player getting attacked has a Shield
+   Pellet Gun and Grenade are ranged items, so for this they arent
+   seen an an item (basic 40 damage).
+   Result set has AttackStatus, DamageDealt, VictimPlayerID, VictimHealth, AttackerScore.
+   ------------------------------------------------------------ */
+CREATE OR ALTER PROCEDURE dbo.usp_Attack
+    @AttackerID INT,
+    @Direction  VARCHAR(10)
+AS
+BEGIN
+    SET NOCOUNT ON;
+ 
+    DECLARE @BaseDamage INT = 40;
+    DECLARE @MaxHealth  INT = 4000;
+ 
+    IF @Direction IS NULL OR @Direction NOT IN ('UP', 'DOWN', 'LEFT', 'RIGHT')
+    BEGIN
+        SELECT 'INVALID_DIRECTION' AS AttackStatus, NULL AS DamageDealt, NULL AS VictimPlayerID, NULL AS VictimHealth, NULL AS AttackerScore;
+        RETURN;
+    END
+ 
+    DECLARE @IsOnline BIT, @IsAdmin BIT, @AttackerTileID INT;
+    SELECT @IsOnline = IsOnline, @IsAdmin = IsAdmin, @AttackerTileID = CurrentTileID
+    FROM dbo.Player
+    WHERE PlayerID = @AttackerID;
+ 
+    IF @@ROWCOUNT = 0
+    BEGIN
+        SELECT 'ATTACKER_NOT_FOUND' AS AttackStatus, NULL AS DamageDealt, NULL AS VictimPlayerID, NULL AS VictimHealth, NULL AS AttackerScore;
+        RETURN;
+    END
+ 
+    --admins can't attack
+    IF @IsAdmin = 1
+    BEGIN
+        SELECT 'ATTACKER_IS_ADMIN' AS AttackStatus, NULL AS DamageDealt, NULL AS VictimPlayerID, NULL AS VictimHealth, NULL AS AttackerScore;
+        RETURN;
+    END
+ 
+    IF @IsOnline = 0
+    BEGIN
+        SELECT 'NOT_ONLINE' AS AttackStatus, NULL AS DamageDealt, NULL AS VictimPlayerID, NULL AS VictimHealth, NULL AS AttackerScore;
+        RETURN;
+    END
+ 
+    IF @AttackerTileID IS NULL
+    BEGIN
+        SELECT 'NO_CURRENT_TILE' AS AttackStatus, NULL AS DamageDealt, NULL AS VictimPlayerID, NULL AS VictimHealth, NULL AS AttackerScore;
+        RETURN;
+    END
+ 
+    --find the tile in front of the attacker
+    DECLARE @DX INT = CASE @Direction WHEN 'LEFT' THEN -1 WHEN 'RIGHT' THEN 1 ELSE 0 END;
+    DECLARE @DY INT = CASE @Direction WHEN 'UP'   THEN -1 WHEN 'DOWN'  THEN 1 ELSE 0 END;
+ 
+    DECLARE @TargetTileID INT;
+    SELECT @TargetTileID = t2.TileID
+    FROM dbo.Tile t1
+    JOIN dbo.Tile t2 ON t2.XPosition = t1.XPosition + @DX
+                    AND t2.YPosition = t1.YPosition + @DY
+    WHERE t1.TileID = @AttackerTileID;
+ 
+    IF @TargetTileID IS NULL
+    BEGIN
+        SELECT 'NOTHING_THERE' AS AttackStatus, NULL AS DamageDealt, NULL AS VictimPlayerID, NULL AS VictimHealth, NULL AS AttackerScore;
+        RETURN;
+    END
+ 
+    --who is standing on that tile? (online, non admins only)
+    --invincibility counts only while active. (InvincibleUntil)
+    --NULL means invincible until changed state (e.g. in the settings screen).
+    DECLARE @VictimID INT, @VictimHealth INT, @VictimInvincible BIT;
+    SELECT @VictimID = PlayerID,
+           @VictimHealth = Health,
+           @VictimInvincible = CASE WHEN IsInvincible = 1
+                                     AND (InvincibleUntil IS NULL OR InvincibleUntil > GETDATE())
+                                    THEN 1 ELSE 0 END
+    FROM dbo.Player
+    WHERE CurrentTileID = @TargetTileID AND IsOnline = 1 AND IsAdmin = 0 AND PlayerID <> @AttackerID;
+ 
+    IF @VictimID IS NULL
+    BEGIN
+        --no player there. If it's the NPC, the NPC procedure (process 8) handles it.
+        IF EXISTS (SELECT 1 FROM dbo.NPC WHERE TileID = @TargetTileID AND IsAlive = 1)
+            SELECT 'NPC_IN_FRONT' AS AttackStatus, NULL AS DamageDealt, NULL AS VictimPlayerID, NULL AS VictimHealth, NULL AS AttackerScore;
+        ELSE
+            SELECT 'NOTHING_THERE' AS AttackStatus, NULL AS DamageDealt, NULL AS VictimPlayerID, NULL AS VictimHealth, NULL AS AttackerScore;
+        RETURN;
+    END
+ 
+    IF @VictimInvincible = 1
+    BEGIN
+        SELECT 'TARGET_INVINCIBLE' AS AttackStatus, NULL AS DamageDealt, @VictimID AS VictimPlayerID, @VictimHealth AS VictimHealth, NULL AS AttackerScore;
+        RETURN;
+    END
+ 
+    --a goose standing on its nest cant be attacked
+    IF EXISTS (SELECT 1 FROM dbo.Nest WHERE PlayerID = @VictimID AND TileID = @TargetTileID)
+    BEGIN
+        SELECT 'TARGET_ON_NEST' AS AttackStatus, NULL AS DamageDealt, @VictimID AS VictimPlayerID, @VictimHealth AS VictimHealth, NULL AS AttackerScore;
+        RETURN;
+    END
+ 
+    --damage, base value gets changed by the attacker's and the defender's items
+    DECLARE @OutMult DECIMAL(4,2) = 1.00;
+    DECLARE @InMult  DECIMAL(4,2) = 1.00;
+ 
+    IF EXISTS (SELECT 1 FROM dbo.Item i JOIN dbo.ItemType it ON it.ItemTypeID = i.ItemTypeID
+               WHERE i.HolderPlayerID = @AttackerID AND it.Name = 'Baseball Bat')
+    BEGIN
+        SET @OutMult = 1.50;
+    END
+    ELSE IF EXISTS (SELECT 1 FROM dbo.Item i JOIN dbo.ItemType it ON it.ItemTypeID = i.ItemTypeID
+                    WHERE i.HolderPlayerID = @AttackerID AND it.Name = 'Shield')
+    BEGIN
+        SET @OutMult = 0.75;
+    END
+ 
+    IF EXISTS (SELECT 1 FROM dbo.Item i JOIN dbo.ItemType it ON it.ItemTypeID = i.ItemTypeID
+               WHERE i.HolderPlayerID = @VictimID AND it.Name = 'Shield')
+    BEGIN
+        SET @InMult = 0.50;
+    END
+ 
+    DECLARE @Damage INT = CAST(ROUND(@BaseDamage * @OutMult * @InMult, 0) AS INT);
+ 
+    --survived hit means lose health then get 0.5 seconds of invincibility
+    IF @VictimHealth - @Damage > 0
+    BEGIN
+        UPDATE dbo.Player
+        SET Health = Health - @Damage,
+            IsInvincible = 1,
+            InvincibleUntil = DATEADD(MILLISECOND, 500, GETDATE())
+        WHERE PlayerID = @VictimID;
+ 
+        SELECT 'HIT' AS AttackStatus, @Damage AS DamageDealt, @VictimID AS VictimPlayerID,
+               @VictimHealth - @Damage AS VictimHealth,
+               (SELECT Score FROM dbo.Player WHERE PlayerID = @AttackerID) AS AttackerScore;
+        RETURN;
+    END
+ 
+    --lethal hit, The attacker scores a point.
+    UPDATE dbo.Player SET Score = Score + 1 WHERE PlayerID = @AttackerID;
+ 
+    --the victim's nest despawns and everything in it is lost.
+    --the item in the victim's beak is lost too.
+    DELETE FROM dbo.Item
+    WHERE HolderPlayerID = @VictimID
+       OR NestID IN (SELECT NestID FROM dbo.Nest WHERE PlayerID = @VictimID);
+    DELETE FROM dbo.Nest WHERE PlayerID = @VictimID;
+ 
+    --respawn on a random free tile somewhere else on the map
+    --not the death tile, and no online player, nest, npc or item on it
+    DECLARE @SpawnTileID INT;
+    SELECT TOP 1 @SpawnTileID = t.TileID
+    FROM dbo.Tile t
+    WHERE t.TileID <> @TargetTileID
+      AND NOT EXISTS (SELECT 1 FROM dbo.Player p WHERE p.CurrentTileID = t.TileID AND p.IsOnline = 1)
+      AND NOT EXISTS (SELECT 1 FROM dbo.Nest   n WHERE n.TileID = t.TileID)
+      AND NOT EXISTS (SELECT 1 FROM dbo.NPC    c WHERE c.TileID = t.TileID AND c.IsAlive = 1)
+      AND NOT EXISTS (SELECT 1 FROM dbo.Item   i WHERE i.TileID = t.TileID)
+    ORDER BY NEWID();
+ 
+    --if the board is completely full, respawn where they fell
+    SET @SpawnTileID = ISNULL(@SpawnTileID, @TargetTileID);
+ 
+    --new nest under them, full health, 5 seconds invincibility
+    INSERT INTO dbo.Nest (PlayerID, TileID) VALUES (@VictimID, @SpawnTileID);
+ 
+    UPDATE dbo.Player
+    SET Health = @MaxHealth,
+        CurrentTileID = @SpawnTileID,
+        IsInvincible = 1,
+        InvincibleUntil = DATEADD(SECOND, 5, GETDATE())
+    WHERE PlayerID = @VictimID;
+ 
+    SELECT 'KILLED' AS AttackStatus, @Damage AS DamageDealt, @VictimID AS VictimPlayerID,
+           @MaxHealth AS VictimHealth,
+           (SELECT Score FROM dbo.Player WHERE PlayerID = @AttackerID) AS AttackerScore;
+END
+GO
+ 
+--test setup: ZandiGoose (PlayerID 2, holds Baseball Bat) on tile 13 (2,2), standing on his nest.
+--McPlayer (PlayerID 3) on tile 14 (2,3), directly below him. Both online, full health.
+UPDATE dbo.Player SET IsOnline = 1, CurrentTileID = 13, Health = 4000, IsInvincible = 0, InvincibleUntil = NULL WHERE PlayerID = 2;
+UPDATE dbo.Player SET IsOnline = 1, CurrentTileID = 14, Health = 4000, IsInvincible = 0, InvincibleUntil = NULL WHERE PlayerID = 3;
+ 
+EXEC dbo.usp_Attack @AttackerID = 2, @Direction = 'DOWN'; --HIT: bat does 60 damage, McPlayer health 3940
+EXEC dbo.usp_Attack @AttackerID = 2, @Direction = 'DOWN'; --TARGET_INVINCIBLE: still inside the 0.5 seconds
+WAITFOR DELAY '00:00:01';
+EXEC dbo.usp_Attack @AttackerID = 2, @Direction = 'DOWN'; --HIT again: McPlayer health 3880
+EXEC dbo.usp_Attack @AttackerID = 3, @Direction = 'UP'; --TARGET_ON_NEST: ZandiGoose is standing on his nest
+ 
+--test setup: McPlayer is nearly dead
+UPDATE dbo.Player SET Health = 50, IsInvincible = 0, InvincibleUntil = NULL WHERE PlayerID = 3;
+EXEC dbo.usp_Attack @AttackerID = 2, @Direction = 'DOWN'; --KILLED: Zandi's score added 1 (3 to 4), McPlayer respawns
+SELECT PlayerID, Username, Score, Health, CurrentTileID, IsInvincible, InvincibleUntil
+FROM dbo.Player WHERE PlayerID IN (2, 3); --McPlayer: health 4000, new tile, invincible for 5 seconds
+SELECT NestID, PlayerID, TileID FROM dbo.Nest; --McPlayer's old nest (tile 7) is gone, a new one spawned
+ 
+--other scenarios
+UPDATE dbo.Player SET CurrentTileID = 12 WHERE PlayerID = 2;
+EXEC dbo.usp_Attack @AttackerID = 2, @Direction = 'UP'; --NPC_IN_FRONT: the NPC is on tile 11 (2,0)
+UPDATE dbo.Player SET CurrentTileID = 1 WHERE PlayerID = 2;
+EXEC dbo.usp_Attack @AttackerID = 2, @Direction = 'LEFT'; --NOTHING_THERE: edge of the board
+EXEC dbo.usp_Attack @AttackerID = 2, @Direction = 'SIDEWAYS'; --INVALID_DIRECTION
+EXEC dbo.usp_Attack @AttackerID = 999, @Direction = 'UP'; --ATTACKER_NOT_FOUND
+EXEC dbo.usp_Attack @AttackerID = 1, @Direction = 'UP'; --ATTACKER_IS_ADMIN (AdminGoose)
+EXEC dbo.usp_Attack @AttackerID = 5, @Direction = 'UP'; --NOT_ONLINE (BrandNewGoose)
+EXEC dbo.usp_Attack @AttackerID = 6, @Direction = 'UP'; --NO_CURRENT_TILE (TestNewPlayer1)
+GO
+
+
+
+/* ------------------------------------------------------------
+   CRUD Process 7: Player game play acquiring inventory.
+   A goose has 1 inventory slot (the item in its beak) plus its
+   nest, which holds up to 9 items.
+   usp_PickUpItem, take the item lying on the player's own tile
+   usp_DropItem, on their nest means store it there, anywhere else means it disappears
+   usp_TakeFromNest, move an item from the nest into the beak
+   Admins have no inventory
+   ------------------------------------------------------------ */
+CREATE OR ALTER PROCEDURE dbo.usp_PickUpItem
+    @PlayerID INT
+AS
+BEGIN
+    SET NOCOUNT ON;
+ 
+    DECLARE @IsOnline BIT, @IsAdmin BIT, @TileID INT;
+    SELECT @IsOnline = IsOnline, @IsAdmin = IsAdmin, @TileID = CurrentTileID
+    FROM dbo.Player
+    WHERE PlayerID = @PlayerID;
+ 
+    IF @@ROWCOUNT = 0
+    BEGIN
+        SELECT 'PLAYER_NOT_FOUND' AS PickUpStatus, NULL AS ItemID, CAST(NULL AS VARCHAR(50)) AS ItemName, NULL AS Ammo;
+        RETURN;
+    END
+    IF @IsAdmin = 1
+    BEGIN
+        SELECT 'ADMIN_HAS_NO_INVENTORY' AS PickUpStatus, NULL AS ItemID, CAST(NULL AS VARCHAR(50)) AS ItemName, NULL AS Ammo;
+        RETURN;
+    END
+    IF @IsOnline = 0
+    BEGIN
+        SELECT 'NOT_ONLINE' AS PickUpStatus, NULL AS ItemID, CAST(NULL AS VARCHAR(50)) AS ItemName, NULL AS Ammo;
+        RETURN;
+    END
+    IF @TileID IS NULL
+    BEGIN
+        SELECT 'NO_CURRENT_TILE' AS PickUpStatus, NULL AS ItemID, CAST(NULL AS VARCHAR(50)) AS ItemName, NULL AS Ammo;
+        RETURN;
+    END
+ 
+    --is there an item on the players tile?
+    DECLARE @ItemID INT, @ItemName VARCHAR(50), @ItemAmmo INT;
+    SELECT @ItemID = i.ItemID, @ItemName = it.Name, @ItemAmmo = i.Ammo
+    FROM dbo.Item i
+    JOIN dbo.ItemType it ON it.ItemTypeID = i.ItemTypeID
+    WHERE i.TileID = @TileID;
+ 
+    IF @ItemID IS NULL
+    BEGIN
+        SELECT 'NO_ITEM' AS PickUpStatus, NULL AS ItemID, CAST(NULL AS VARCHAR(50)) AS ItemName, NULL AS Ammo;
+        RETURN;
+    END
+ 
+    --is the beak already full?
+    DECLARE @HeldItemID INT, @HeldName VARCHAR(50);
+    SELECT @HeldItemID = i.ItemID, @HeldName = it.Name
+    FROM dbo.Item i
+    JOIN dbo.ItemType it ON it.ItemTypeID = i.ItemTypeID
+    WHERE i.HolderPlayerID = @PlayerID;
+ 
+    IF @HeldItemID IS NOT NULL
+    BEGIN
+        -- picking up a second pellet gun while holding one adds to its ammo
+        IF @HeldName = 'Pellet Gun' AND @ItemName = 'Pellet Gun'
+        BEGIN
+            UPDATE dbo.Item SET Ammo = ISNULL(Ammo, 0) + ISNULL(@ItemAmmo, 0) WHERE ItemID = @HeldItemID;
+            DELETE FROM dbo.Item WHERE ItemID = @ItemID;
+ 
+            SELECT 'AMMO_ADDED' AS PickUpStatus, @HeldItemID AS ItemID, @HeldName AS ItemName,
+                   (SELECT Ammo FROM dbo.Item WHERE ItemID = @HeldItemID) AS Ammo;
+            RETURN;
+        END
+ 
+        SELECT 'INVENTORY_FULL' AS PickUpStatus, NULL AS ItemID, CAST(NULL AS VARCHAR(50)) AS ItemName, NULL AS Ammo;
+        RETURN;
+    END
+ 
+    --Move the item from the tile into the player's beak
+    UPDATE dbo.Item SET TileID = NULL, HolderPlayerID = @PlayerID WHERE ItemID = @ItemID;
+ 
+    SELECT 'SUCCESS' AS PickUpStatus, @ItemID AS ItemID, @ItemName AS ItemName, @ItemAmmo AS Ammo;
+END
+GO
+ 
+CREATE OR ALTER PROCEDURE dbo.usp_DropItem
+    @PlayerID INT
+AS
+BEGIN
+    SET NOCOUNT ON;
+ 
+    DECLARE @IsOnline BIT, @IsAdmin BIT, @TileID INT;
+    SELECT @IsOnline = IsOnline, @IsAdmin = IsAdmin, @TileID = CurrentTileID
+    FROM dbo.Player
+    WHERE PlayerID = @PlayerID;
+ 
+    IF @@ROWCOUNT = 0
+    BEGIN
+        SELECT 'PLAYER_NOT_FOUND' AS DropStatus, NULL AS ItemID;
+        RETURN;
+    END
+    IF @IsAdmin = 1
+    BEGIN
+        SELECT 'ADMIN_HAS_NO_INVENTORY' AS DropStatus, NULL AS ItemID;
+        RETURN;
+    END
+    IF @IsOnline = 0
+    BEGIN
+        SELECT 'NOT_ONLINE' AS DropStatus, NULL AS ItemID;
+        RETURN;
+    END
+ 
+    DECLARE @ItemID INT;
+    SELECT @ItemID = ItemID FROM dbo.Item WHERE HolderPlayerID = @PlayerID;
+ 
+    IF @ItemID IS NULL
+    BEGIN
+        SELECT 'NOTHING_HELD' AS DropStatus, NULL AS ItemID;
+        RETURN;
+    END
+ 
+    --standing on their own nest?
+    DECLARE @NestID INT;
+    SELECT @NestID = NestID FROM dbo.Nest WHERE PlayerID = @PlayerID AND TileID = @TileID;
+ 
+    IF @NestID IS NOT NULL
+    BEGIN
+        --nest holds up to 9 things, when full dropping does nothing
+        IF (SELECT COUNT(*) FROM dbo.Item WHERE NestID = @NestID) >= 9
+        BEGIN
+            SELECT 'NEST_FULL' AS DropStatus, @ItemID AS ItemID;
+            RETURN;
+        END
+ 
+        UPDATE dbo.Item SET HolderPlayerID = NULL, NestID = @NestID WHERE ItemID = @ItemID;
+        SELECT 'STORED_IN_NEST' AS DropStatus, @ItemID AS ItemID;
+        RETURN;
+    END
+ 
+    --anywhere else means a dropped item always disappears
+    DELETE FROM dbo.Item WHERE ItemID = @ItemID;
+    SELECT 'DISCARDED' AS DropStatus, @ItemID AS ItemID;
+END
+GO
+ 
+CREATE OR ALTER PROCEDURE dbo.usp_TakeFromNest
+    @PlayerID INT,
+    @ItemID   INT
+AS
+BEGIN
+    SET NOCOUNT ON;
+ 
+    DECLARE @IsOnline BIT, @IsAdmin BIT, @TileID INT;
+    SELECT @IsOnline = IsOnline, @IsAdmin = IsAdmin, @TileID = CurrentTileID
+    FROM dbo.Player
+    WHERE PlayerID = @PlayerID;
+ 
+    IF @@ROWCOUNT = 0
+    BEGIN
+        SELECT 'PLAYER_NOT_FOUND' AS TakeStatus, NULL AS ItemID;
+        RETURN;
+    END
+    IF @IsAdmin = 1
+    BEGIN
+        SELECT 'ADMIN_HAS_NO_INVENTORY' AS TakeStatus, NULL AS ItemID;
+        RETURN;
+    END
+    IF @IsOnline = 0
+    BEGIN
+        SELECT 'NOT_ONLINE' AS TakeStatus, NULL AS ItemID;
+        RETURN;
+    END
+ 
+    --the nest inventory is only open while standing on the nest
+    DECLARE @NestID INT;
+    SELECT @NestID = NestID FROM dbo.Nest WHERE PlayerID = @PlayerID AND TileID = @TileID;
+ 
+    IF @NestID IS NULL
+    BEGIN
+        SELECT 'NOT_ON_NEST' AS TakeStatus, NULL AS ItemID;
+        RETURN;
+    END
+ 
+    IF NOT EXISTS (SELECT 1 FROM dbo.Item WHERE ItemID = @ItemID AND NestID = @NestID)
+    BEGIN
+        SELECT 'ITEM_NOT_IN_NEST' AS TakeStatus, NULL AS ItemID;
+        RETURN;
+    END
+ 
+    IF EXISTS (SELECT 1 FROM dbo.Item WHERE HolderPlayerID = @PlayerID)
+    BEGIN
+        SELECT 'INVENTORY_FULL' AS TakeStatus, NULL AS ItemID;
+        RETURN;
+    END
+ 
+    UPDATE dbo.Item SET NestID = NULL, HolderPlayerID = @PlayerID WHERE ItemID = @ItemID;
+    SELECT 'SUCCESS' AS TakeStatus, @ItemID AS ItemID;
+END
+GO
+ 
+--test setup: ZandiGoose (PlayerID 2) online on tile 19 (3,3), where the watermelon is,
+--holding his bat. His nest (NestID 1) is on tile 13 and has a shield (ItemID 2) and peas (ItemID 3).
+UPDATE dbo.Player SET IsOnline = 1, CurrentTileID = 19 WHERE PlayerID = 2;
+ 
+EXEC dbo.usp_PickUpItem @PlayerID = 2; --INVENTORY_FULL: he is already holding the bat
+ 
+UPDATE dbo.Player SET CurrentTileID = 13 WHERE PlayerID = 2; --walk onto his nest
+EXEC dbo.usp_DropItem @PlayerID = 2; --STORED_IN_NEST: the bat goes into the nest
+EXEC dbo.usp_DropItem @PlayerID = 2; --NOTHING_HELD
+ 
+UPDATE dbo.Player SET CurrentTileID = 19 WHERE PlayerID = 2;--back to the watermelon
+EXEC dbo.usp_PickUpItem @PlayerID = 2; --SUCCESS: he picks up the watermelon
+EXEC dbo.usp_PickUpItem @PlayerID = 2; --NO_ITEM: the tile is empty now
+ 
+UPDATE dbo.Player SET CurrentTileID = 12 WHERE PlayerID = 2; --a tile with no nest
+EXEC dbo.usp_DropItem @PlayerID = 2; --DISCARDED: the watermelon disappears
+EXEC dbo.usp_TakeFromNest @PlayerID = 2, @ItemID = 2; --NOT_ON_NEST
+ 
+UPDATE dbo.Player SET CurrentTileID = 13 WHERE PlayerID = 2; --back on his nest
+EXEC dbo.usp_TakeFromNest @PlayerID = 2, @ItemID = 999; --ITEM_NOT_IN_NEST
+EXEC dbo.usp_TakeFromNest @PlayerID = 2, @ItemID = 2; --SUCCESS: shield into his beak
+EXEC dbo.usp_TakeFromNest @PlayerID = 2, @ItemID = 3; --INVENTORY_FULL: he already has the shield
+GO
+ 
+--nest capacity: fill his nest to 9 items, then try to store the shield
+DECLARE @n INT = 0;
+WHILE @n < 7
+BEGIN
+    INSERT INTO dbo.Item (ItemTypeID, NestID) VALUES (5, 1); --7 extra peas (nest already holds the bat and the peas)
+    SET @n += 1;
+END
+EXEC dbo.usp_DropItem @PlayerID = 2; --NEST_FULL
+DELETE TOP (7) FROM dbo.Item WHERE NestID = 1 AND ItemTypeID = 5 AND ItemID <> 3; --remove the extra peas again
+GO
+ 
+--pellet gun ammo stacking: he has a gun with 4 ammo and stands on a tile with another gun (7 ammo)
+DELETE FROM dbo.Item WHERE HolderPlayerID = 2; --drop the shield
+INSERT INTO dbo.Item (ItemTypeID, HolderPlayerID, Ammo) VALUES (2, 2, 4);
+UPDATE dbo.Player SET CurrentTileID = 6 WHERE PlayerID = 2;
+EXEC dbo.usp_PickUpItem @PlayerID = 2; --AMMO_ADDED: 4 + 7 = 11 ammo, the gun on tile 6 is used up
+ 
+EXEC dbo.usp_PickUpItem @PlayerID = 999; --PLAYER_NOT_FOUND
+EXEC dbo.usp_PickUpItem @PlayerID = 1; --ADMIN_HAS_NO_INVENTORY
+EXEC dbo.usp_PickUpItem @PlayerID = 5; --NOT_ONLINE
+EXEC dbo.usp_PickUpItem @PlayerID = 6; --NO_CURRENT_TILE
+GO
+ 
