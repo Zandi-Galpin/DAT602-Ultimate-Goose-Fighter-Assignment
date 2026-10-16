@@ -365,6 +365,67 @@ EXEC dbo.usp_MovePlayer @PlayerID = 6, @Direction = 'UP'; --NO_CURRENT_TILE (pla
 GO
 
 
+/* ------------------------------------------------------------
+   Process 8 helper: usp_DamageNpc. here because usp_Attack calls it.
+   reduces the npc's health. If that kills it: the NPC is marked dead, a
+   1 minute respawn timer starts, and it drops 1 random item or
+   consumable on its tile, every type is equally likely, ignoring spawn
+   rates, so rare items drop more often than they spawn.
+   The drop is skipped if the tile already holds an item (one item per tile).
+   ------------------------------------------------------------ */
+CREATE OR ALTER PROCEDURE dbo.usp_DamageNpc
+    @NpcID INT,
+    @Damage INT,
+    @NpcHealthLeft INT OUTPUT,
+    @NpcKilled BIT OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;
+ 
+    DECLARE @Health INT, @TileID INT;
+    SELECT @Health = Health, @TileID = TileID
+    FROM dbo.NPC
+    WHERE NPCID = @NpcID AND IsAlive = 1;
+ 
+    --no npc, or it is already dead
+    IF @@ROWCOUNT = 0
+    BEGIN
+        SET @NpcHealthLeft = NULL;
+        SET @NpcKilled = 0;
+        RETURN;
+    END
+ 
+    --survivable hit
+    IF @Health - @Damage > 0
+    BEGIN
+        UPDATE dbo.NPC SET Health = Health - @Damage WHERE NPCID = @NpcID;
+        SET @NpcHealthLeft = @Health - @Damage;
+        SET @NpcKilled = 0;
+        RETURN;
+    END
+ 
+    --defeated: dead, with a respawn timer of 1 minute
+    UPDATE dbo.NPC
+    SET Health = 0, IsAlive = 0, RespawnTime = DATEADD(MINUTE, 1, GETDATE())
+    WHERE NPCID = @NpcID;
+ 
+    IF NOT EXISTS (SELECT 1 FROM dbo.Item WHERE TileID = @TileID)
+    BEGIN
+        DECLARE @DropTypeID INT, @DropAmmo INT = NULL;
+        SELECT TOP 1 @DropTypeID = ItemTypeID FROM dbo.ItemType ORDER BY NEWID();
+ 
+        IF EXISTS (SELECT 1 FROM dbo.ItemType WHERE ItemTypeID = @DropTypeID AND Name = 'Pellet Gun')
+            SET @DropAmmo = ABS(CHECKSUM(NEWID()) % 8) + 3;
+ 
+        INSERT INTO dbo.Item (ItemTypeID, TileID, Ammo) VALUES (@DropTypeID, @TileID, @DropAmmo);
+    END
+ 
+    SET @NpcHealthLeft = 0;
+    SET @NpcKilled = 1;
+END
+GO
+ 
+
 
 /* ------------------------------------------------------------
    CRUD Process 6: Gameplay scoring.
@@ -834,3 +895,207 @@ EXEC dbo.usp_PickUpItem @PlayerID = 5; --NOT_ONLINE
 EXEC dbo.usp_PickUpItem @PlayerID = 6; --NO_CURRENT_TILE
 GO
  
+
+
+/* ------------------------------------------------------------
+   CRUD Process 4 (continued): natural random item spawning.
+   Items spawn randomly, but only while at least 2 players are online.
+   The item type is picked using the SpawnRate column as weights.
+   ------------------------------------------------------------ */
+CREATE OR ALTER PROCEDURE dbo.usp_SpawnRandomItem
+AS
+BEGIN
+    SET NOCOUNT ON;
+ 
+    IF (SELECT COUNT(*) FROM dbo.Player WHERE IsOnline = 1 AND IsAdmin = 0) < 2
+    BEGIN
+        SELECT NULL AS ItemID, NULL AS TileID, NULL AS ItemTypeID, 'NOT_ENOUGH_PLAYERS' AS SpawnStatus;
+        RETURN;
+    END
+ 
+    DECLARE @Total DECIMAL(10,2) = (SELECT SUM(ISNULL(SpawnRate, 0)) FROM dbo.ItemType);
+    IF @Total IS NULL OR @Total <= 0
+    BEGIN
+        SELECT NULL AS ItemID, NULL AS TileID, NULL AS ItemTypeID, 'NO_SPAWN_RATES' AS SpawnStatus;
+        RETURN;
+    END
+ 
+    --a random tile with nothing on it
+    DECLARE @SpawnTileID INT;
+    SELECT TOP 1 @SpawnTileID = t.TileID
+    FROM dbo.Tile t
+    WHERE NOT EXISTS (SELECT 1 FROM dbo.Player p WHERE p.CurrentTileID = t.TileID AND p.IsOnline = 1)
+      AND NOT EXISTS (SELECT 1 FROM dbo.Nest n WHERE n.TileID = t.TileID)
+      AND NOT EXISTS (SELECT 1 FROM dbo.NPC c WHERE c.TileID = t.TileID AND c.IsAlive = 1)
+      AND NOT EXISTS (SELECT 1 FROM dbo.Item i WHERE i.TileID = t.TileID)
+    ORDER BY NEWID();
+ 
+    IF @SpawnTileID IS NULL
+    BEGIN
+        SELECT NULL AS ItemID, NULL AS TileID, NULL AS ItemTypeID, 'NO_FREE_TILE' AS SpawnStatus;
+        RETURN;
+    END
+ 
+    --roll a number between 0 and the total weight, then take the
+    --first item type whose total of spawn rates goes past the roll number
+    DECLARE @Roll DECIMAL(10,4) = (ABS(CHECKSUM(NEWID()) % 10000) / 10000.0) * @Total;
+    DECLARE @ItemTypeID INT;
+    SELECT TOP 1 @ItemTypeID = r.ItemTypeID
+    FROM (SELECT ItemTypeID,
+                 SUM(ISNULL(SpawnRate, 0)) OVER (ORDER BY ItemTypeID ROWS UNBOUNDED PRECEDING) AS RunningTotal
+          FROM dbo.ItemType) r
+    WHERE r.RunningTotal > @Roll
+    ORDER BY r.RunningTotal;
+ 
+    DECLARE @Ammo INT = NULL;
+    IF EXISTS (SELECT 1 FROM dbo.ItemType WHERE ItemTypeID = @ItemTypeID AND Name = 'Pellet Gun')
+        SET @Ammo = ABS(CHECKSUM(NEWID()) % 8) + 3;
+ 
+    INSERT INTO dbo.Item (ItemTypeID, TileID, Ammo) VALUES (@ItemTypeID, @SpawnTileID, @Ammo);
+ 
+    SELECT SCOPE_IDENTITY() AS ItemID, @SpawnTileID AS TileID, @ItemTypeID AS ItemTypeID, 'SUCCESS' AS SpawnStatus;
+END
+GO
+ 
+--test calls (random results)
+UPDATE dbo.Player SET IsOnline = 1 WHERE PlayerID IN (2, 3);
+EXEC dbo.usp_SpawnRandomItem; --SUCCESS
+EXEC dbo.usp_SpawnRandomItem; --SUCCESS
+UPDATE dbo.Player SET IsOnline = 0 WHERE PlayerID = 3;
+EXEC dbo.usp_SpawnRandomItem; --NOT_ENOUGH_PLAYERS (only ZandiGoose online)
+UPDATE dbo.Player SET IsOnline = 1 WHERE PlayerID = 3;
+GO
+ 
+
+
+/* ------------------------------------------------------------
+   CRUD Process 8: move an item (NPC effect).
+   The npc wanders one tile at a time; the app calls usp_MoveNpc based on a
+   random 1-5 second timer. usp_DamageNpc handles NPC damage and
+   death drops; usp_RespawnNpc brings it back after the 1 minute timer.
+   ------------------------------------------------------------ */
+CREATE OR ALTER PROCEDURE dbo.usp_MoveNpc
+    @NpcID INT
+AS
+BEGIN
+    SET NOCOUNT ON;
+ 
+    DECLARE @TileID INT, @IsAlive BIT;
+    SELECT @TileID = TileID, @IsAlive = IsAlive FROM dbo.NPC WHERE NPCID = @NpcID;
+ 
+    IF @@ROWCOUNT = 0
+    BEGIN
+        SELECT NULL AS NewTileID, NULL AS NewX, NULL AS NewY, 'NPC_NOT_FOUND' AS MoveNpcStatus;
+        RETURN;
+    END
+    IF @IsAlive = 0
+    BEGIN
+        SELECT NULL AS NewTileID, NULL AS NewX, NULL AS NewY, 'NPC_DEAD' AS MoveNpcStatus;
+        RETURN;
+    END
+ 
+    --pick 1 random tile touching this one that has no online player standing on it
+    DECLARE @NewTileID INT, @NewX INT, @NewY INT;
+    SELECT TOP 1 @NewTileID = t2.TileID, @NewX = t2.XPosition, @NewY = t2.YPosition
+    FROM dbo.Tile t1
+    JOIN dbo.Tile t2 ON ABS(t2.XPosition - t1.XPosition) + ABS(t2.YPosition - t1.YPosition) = 1
+    WHERE t1.TileID = @TileID
+      AND NOT EXISTS (SELECT 1 FROM dbo.Player p WHERE p.CurrentTileID = t2.TileID AND p.IsOnline = 1)
+    ORDER BY NEWID();
+ 
+    IF @NewTileID IS NULL
+    BEGIN
+        SELECT NULL AS NewTileID, NULL AS NewX, NULL AS NewY, 'NO_LEGAL_MOVE' AS MoveNpcStatus;
+        RETURN;
+    END
+ 
+    UPDATE dbo.NPC SET TileID = @NewTileID WHERE NPCID = @NpcID;
+ 
+    SELECT @NewTileID AS NewTileID, @NewX AS NewX, @NewY AS NewY, 'SUCCESS' AS MoveNpcStatus;
+END
+GO
+ 
+CREATE OR ALTER PROCEDURE dbo.usp_RespawnNpc
+AS
+BEGIN
+    SET NOCOUNT ON;
+ 
+    --never more than one npc on the map
+    IF EXISTS (SELECT 1 FROM dbo.NPC WHERE IsAlive = 1)
+    BEGIN
+        SELECT NULL AS NpcID, NULL AS TileID, 'ALREADY_ALIVE' AS RespawnStatus;
+        RETURN;
+    END
+ 
+    DECLARE @NpcID INT, @RespawnTime DATETIME;
+    SELECT TOP 1 @NpcID = NPCID, @RespawnTime = RespawnTime
+    FROM dbo.NPC
+    WHERE IsAlive = 0
+    ORDER BY NPCID;
+ 
+    --the 1 minute timer has not run out yet
+    IF @RespawnTime IS NOT NULL AND @RespawnTime > GETDATE()
+    BEGIN
+        SELECT @NpcID AS NpcID, NULL AS TileID, 'NOT_READY' AS RespawnStatus;
+        RETURN;
+    END
+ 
+    --respawn on a random tile with no online player, nest or item
+    DECLARE @SpawnTileID INT;
+    SELECT TOP 1 @SpawnTileID = t.TileID
+    FROM dbo.Tile t
+    WHERE NOT EXISTS (SELECT 1 FROM dbo.Player p WHERE p.CurrentTileID = t.TileID AND p.IsOnline = 1)
+      AND NOT EXISTS (SELECT 1 FROM dbo.Nest   n WHERE n.TileID = t.TileID)
+      AND NOT EXISTS (SELECT 1 FROM dbo.Item   i WHERE i.TileID = t.TileID)
+    ORDER BY NEWID();
+ 
+    IF @SpawnTileID IS NULL
+    BEGIN
+        SELECT @NpcID AS NpcID, NULL AS TileID, 'NO_FREE_TILE' AS RespawnStatus;
+        RETURN;
+    END
+ 
+    IF @NpcID IS NULL
+    BEGIN
+        --create the first npc row
+        INSERT INTO dbo.NPC (TileID, Health, MaxHealth, IsAlive) VALUES (@SpawnTileID, 1000, 1000, 1);
+        SET @NpcID = SCOPE_IDENTITY();
+    END
+    ELSE
+    BEGIN
+        UPDATE dbo.NPC
+        SET TileID = @SpawnTileID, Health = MaxHealth, IsAlive = 1, RespawnTime = NULL
+        WHERE NPCID = @NpcID;
+    END
+ 
+    SELECT @NpcID AS NpcID, @SpawnTileID AS TileID, 'SUCCESS' AS RespawnStatus;
+END
+GO
+ 
+--test calls
+EXEC dbo.usp_MoveNpc @NpcID = 1; --SUCCESS: one random step from wherever it stands
+EXEC dbo.usp_MoveNpc @NpcID = 1; --again
+EXEC dbo.usp_MoveNpc @NpcID = 999; --NPC_NOT_FOUND
+EXEC dbo.usp_RespawnNpc; --ALREADY_ALIVE
+ 
+--kill the npc, set it to 50 health, then deal 60 damage
+UPDATE dbo.NPC SET Health = 50 WHERE NPCID = 1;
+GO
+ 
+DECLARE @HealthLeft INT, @Killed BIT;
+EXEC dbo.usp_DamageNpc @NpcID = 1, @Damage = 60, @NpcHealthLeft = @HealthLeft OUTPUT, @NpcKilled = @Killed OUTPUT;
+SELECT @HealthLeft AS NpcHealthLeft, @Killed AS NpcKilled; --should be 0 and 1
+SELECT NPCID, TileID, Health, IsAlive, RespawnTime FROM dbo.NPC; --dead, RespawnTime 1 minute away
+--random drop, one item on the npc tile (none if that tile already held an item)
+SELECT i.ItemID, it.Name, i.TileID, i.Ammo
+FROM dbo.Item i JOIN dbo.ItemType it ON it.ItemTypeID = i.ItemTypeID
+WHERE i.TileID = (SELECT TileID FROM dbo.NPC WHERE NPCID = 1);
+GO
+ 
+EXEC dbo.usp_MoveNpc @NpcID = 1; --NPC_DEAD
+EXEC dbo.usp_RespawnNpc; --NOT_READY: the 1 minute timer is still running
+UPDATE dbo.NPC SET RespawnTime = DATEADD(MINUTE, -1, GETDATE()) WHERE NPCID = 1; --pretend a minute has passed
+EXEC dbo.usp_RespawnNpc; --SUCCESS: back at full health on a random free tile
+EXEC dbo.usp_RespawnNpc; --ALREADY_ALIVE
+SELECT NPCID, TileID, Health, IsAlive, RespawnTime FROM dbo.NPC;
+GO
