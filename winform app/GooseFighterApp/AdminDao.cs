@@ -104,6 +104,44 @@ namespace GooseFighterApp
         }
 
         /// <summary>
+        /// Calls usp_GetItemTypes. Rows: ItemTypeID, Name, Category, EffectDescription, SpawnRate.
+        /// Fills the item picker on the admin screen.
+        /// </summary>
+        public DataTable GetItemTypes()
+        {
+            return ExecuteProcedure("dbo.usp_GetItemTypes");
+        }
+
+        /// <summary>
+        /// Calls usp_GetAllPlayers. One row per player:
+        /// PlayerID, Username, Email, Score, IsAdmin, IsOnline, IsLockedOut (no passwords).
+        /// </summary>
+        public DataTable GetAllPlayers()
+        {
+            return ExecuteProcedure("dbo.usp_GetAllPlayers");
+        }
+
+        /// <summary>
+        /// Calls usp_GetPlayer. One row (no row if the player doesn't exist):
+        /// PlayerID, Email, Username, Password, Score, Health, IsAdmin, IsOnline, IsLockedOut,
+        /// CurrentTileID, X, Y, HeldItem, HeldAmmo. The admin edit boxes show the password
+        /// in plaintext (storyboard 11).
+        /// </summary>
+        public DataTable GetPlayer(int playerId)
+        {
+            return ExecuteProcedure("dbo.usp_GetPlayer",
+                Param("@PlayerID", SqlDbType.Int, playerId));
+        }
+
+        /// <summary>
+        /// Calls usp_GetBoard. One row per tile: TileID, X, Y, Goose, Npc, Item, NestOf.
+        /// </summary>
+        public DataTable GetBoard()
+        {
+            return ExecuteProcedure("dbo.usp_GetBoard");
+        }
+
+        /// <summary>
         /// old method (usp_TestAddPlayer, no admin check).
         /// AdminForm still calls this until i switched
         /// </summary>

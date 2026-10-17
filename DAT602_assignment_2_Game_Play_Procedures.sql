@@ -1446,3 +1446,213 @@ SELECT MessageID, SenderPlayerID FROM dbo.ChatMessage; --chat messages are gone
 GO
  
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+ /* ------------------------------------------------------------
+
+   Supporting procedures for the GUI
+   The 12 CRUD processes only write to the database. The screens also
+   need to read data to show it (the players list, the board, a player's
+   score and held item), and a player needs to be put on the map when they
+   enter the game.
+   ------------------------------------------------------------ */
+
+/* ------------------------------------------------------------
+   usp_SpawnPlayer: puts an online player on the map 
+     A returning player keeps their saved tile if no other online player
+       ornpc is on it
+       otherwise, or for a brand new player with no tile, they get a random
+       free tile, A player who has no nest gets one on that tile.
+   Admins have no goose or nest, so they are not spawned.
+   ------------------------------------------------------------ */
+CREATE OR ALTER PROCEDURE dbo.usp_SpawnPlayer
+    @PlayerID INT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @IsOnline BIT, @IsAdmin BIT, @CurrentTileID INT;
+    SELECT @IsOnline = IsOnline, @IsAdmin = IsAdmin, @CurrentTileID = CurrentTileID
+    FROM dbo.Player
+    WHERE PlayerID = @PlayerID;
+
+    IF @@ROWCOUNT = 0
+    BEGIN
+        SELECT NULL AS TileID, 'PLAYER_NOT_FOUND' AS SpawnStatus;
+        RETURN;
+    END
+
+    IF @IsAdmin = 1
+    BEGIN
+        SELECT NULL AS TileID, 'NOT_FOR_ADMIN' AS SpawnStatus;
+        RETURN;
+    END
+
+    IF @IsOnline = 0
+    BEGIN
+        SELECT NULL AS TileID, 'NOT_ONLINE' AS SpawnStatus;
+        RETURN;
+    END
+
+    DECLARE @HasNest BIT = CASE WHEN EXISTS (SELECT 1 FROM dbo.Nest WHERE PlayerID = @PlayerID) THEN 1 ELSE 0 END;
+    DECLARE @TileID INT = NULL;
+
+    --keep the saved tile if it is still free.
+    IF @CurrentTileID IS NOT NULL
+       AND NOT EXISTS (SELECT 1 FROM dbo.Player WHERE CurrentTileID = @CurrentTileID AND IsOnline = 1 AND PlayerID <> @PlayerID)
+       AND NOT EXISTS (SELECT 1 FROM dbo.NPC WHERE TileID = @CurrentTileID AND IsAlive = 1)
+       AND (@HasNest = 1 OR NOT EXISTS (SELECT 1 FROM dbo.Nest WHERE TileID = @CurrentTileID))
+    BEGIN
+        SET @TileID = @CurrentTileID;
+    END
+    ELSE
+    BEGIN
+        --random tile with no online player, nest, living NPC or item on it
+        SELECT TOP 1 @TileID = t.TileID
+        FROM dbo.Tile t
+        WHERE NOT EXISTS (SELECT 1 FROM dbo.Player p WHERE p.CurrentTileID = t.TileID AND p.IsOnline = 1 AND p.PlayerID <> @PlayerID)
+          AND NOT EXISTS (SELECT 1 FROM dbo.Nest   n WHERE n.TileID = t.TileID)
+          AND NOT EXISTS (SELECT 1 FROM dbo.NPC    c WHERE c.TileID = t.TileID AND c.IsAlive = 1)
+          AND NOT EXISTS (SELECT 1 FROM dbo.Item   i WHERE i.TileID = t.TileID)
+        ORDER BY NEWID();
+
+        IF @TileID IS NULL
+        BEGIN
+            SELECT NULL AS TileID, 'NO_FREE_TILE' AS SpawnStatus;
+            RETURN;
+        END
+    END
+
+    UPDATE dbo.Player SET CurrentTileID = @TileID WHERE PlayerID = @PlayerID;
+
+    --every goose has a nest: create one for a player who has none
+    IF @HasNest = 0
+    BEGIN
+        INSERT INTO dbo.Nest (PlayerID, TileID) VALUES (@PlayerID, @TileID);
+    END
+
+    SELECT @TileID AS TileID,
+           CASE WHEN @TileID = @CurrentTileID THEN 'RETURNED' ELSE 'SPAWNED' END AS SpawnStatus;
+END
+GO
+
+
+/* ------------------------------------------------------------
+   Read-only procedures. return the rows with no
+   status column. An empty result means not found".
+   ------------------------------------------------------------ */
+
+--one player's details, their position and the item in their beak.
+--used by the player's score/health display and the admin edit boxes.
+CREATE OR ALTER PROCEDURE dbo.usp_GetPlayer
+    @PlayerID INT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    SELECT p.PlayerID, p.Email, p.Username, p.Password, p.Score, p.Health,
+           p.IsAdmin, p.IsOnline, p.IsLockedOut,
+           p.CurrentTileID, t.XPosition AS X, t.YPosition AS Y,
+           it.Name AS HeldItem, i.Ammo AS HeldAmmo
+    FROM dbo.Player p
+    LEFT JOIN dbo.Tile t      ON t.TileID = p.CurrentTileID
+    LEFT JOIN dbo.Item i      ON i.HolderPlayerID = p.PlayerID
+    LEFT JOIN dbo.ItemType it ON it.ItemTypeID = i.ItemTypeID
+    WHERE p.PlayerID = @PlayerID;
+END
+GO
+
+--every player, for the admin's players list (no passwords)
+CREATE OR ALTER PROCEDURE dbo.usp_GetAllPlayers
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    SELECT PlayerID, Username, Email, Score, IsAdmin, IsOnline, IsLockedOut
+    FROM dbo.Player
+    ORDER BY Username;
+END
+GO
+
+--every tile and what is on it, row by row like the map (top row first)
+CREATE OR ALTER PROCEDURE dbo.usp_GetBoard
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    SELECT t.TileID, t.XPosition AS X, t.YPosition AS Y,
+           (SELECT TOP 1 p.Username FROM dbo.Player p
+            WHERE p.CurrentTileID = t.TileID AND p.IsOnline = 1 ORDER BY p.Username) AS Goose,
+           CASE WHEN EXISTS (SELECT 1 FROM dbo.NPC c WHERE c.TileID = t.TileID AND c.IsAlive = 1)
+                THEN 'NPC' END AS Npc,
+           (SELECT TOP 1 it.Name FROM dbo.Item i
+            JOIN dbo.ItemType it ON it.ItemTypeID = i.ItemTypeID
+            WHERE i.TileID = t.TileID) AS Item,
+           (SELECT TOP 1 pn.Username FROM dbo.Nest n
+            JOIN dbo.Player pn ON pn.PlayerID = n.PlayerID
+            WHERE n.TileID = t.TileID) AS NestOf
+    FROM dbo.Tile t
+    ORDER BY t.YPosition, t.XPosition;
+END
+GO
+
+--the items stored in one player's nest (the nest list on the game screen)
+CREATE OR ALTER PROCEDURE dbo.usp_GetNestContents
+    @PlayerID INT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    SELECT i.ItemID, it.Name AS ItemName, i.Ammo
+    FROM dbo.Item i
+    JOIN dbo.Nest n      ON n.NestID = i.NestID
+    JOIN dbo.ItemType it ON it.ItemTypeID = i.ItemTypeID
+    WHERE n.PlayerID = @PlayerID
+    ORDER BY i.ItemID;
+END
+GO
+
+--the item types, for the admin's "place item" dropdown
+CREATE OR ALTER PROCEDURE dbo.usp_GetItemTypes
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    SELECT ItemTypeID, Name, Category
+    FROM dbo.ItemType
+    ORDER BY ItemTypeID;
+END
+GO
+
+
+--test calls. T players 2 and 3 have been deleted
+--by the CRUD 12 tests. Player 5 (BranfNewGoose) and 6 (NewPlayer1) still exist.
+EXEC dbo.usp_SpawnPlayer @PlayerID = 5; --NOT_ONLINE: BranfNewGoose has never logged in
+UPDATE dbo.Player SET IsOnline = 1 WHERE PlayerID = 5;
+EXEC dbo.usp_SpawnPlayer @PlayerID = 5; --SPAWNED: a random free tile, and a new nest is created
+EXEC dbo.usp_SpawnPlayer @PlayerID = 5; --RETURNED: keeps the tile it was just given
+
+--put NewPlayer1 online on the same tile as player 5, so its saved tile is taken
+UPDATE dbo.Player SET IsOnline = 1, CurrentTileID = (SELECT CurrentTileID FROM dbo.Player WHERE PlayerID = 5) WHERE PlayerID = 6;
+EXEC dbo.usp_SpawnPlayer @PlayerID = 6; --SPAWNED: blocked, so a different random tile, and a nest is created
+EXEC dbo.usp_SpawnPlayer @PlayerID = 1; --NOT_FOR_ADMIN
+EXEC dbo.usp_SpawnPlayer @PlayerID = 999; --PLAYER_NOT_FOUND
+
+EXEC dbo.usp_GetPlayer @PlayerID = 5; --one row: tile, X, Y filled in; HeldItem and HeldAmmo NULL
+EXEC dbo.usp_GetPlayer @PlayerID = 999;--no rows
+EXEC dbo.usp_GetAllPlayers; --every player, sorted by username
+EXEC dbo.usp_GetBoard; --one row per tile; players 5 and 6 and their nests show up
+EXEC dbo.usp_GetNestContents @PlayerID = 5; --no rows: the new nest is empty
+EXEC dbo.usp_GetItemTypes; --the 8 item types
+GO

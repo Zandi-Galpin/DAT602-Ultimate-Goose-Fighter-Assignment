@@ -122,6 +122,48 @@ namespace GooseFighterApp
         }
 
         /// <summary>
+        /// Calls usp_SpawnPlayer when a regular player enters the game screen.
+        /// Result contains TileID, X, Y, SpawnStatus (SPAWNED for a brand new player,
+        /// RETURNED if they were already on the map, otherwise PLAYER_NOT_FOUND,
+        /// ADMIN_NO_SPAWN, NOT_ONLINE or NO_FREE_TILE).
+        /// </summary>
+        public DataTable SpawnPlayer(int playerId)
+        {
+            return ExecuteProcedure("dbo.usp_SpawnPlayer",
+                Param("@PlayerID", SqlDbType.Int, playerId));
+        }
+
+        /// <summary>
+        /// Calls usp_GetPlayer. One row (no row if the player doesn't exist):
+        /// PlayerID, Email, Username, Password, Score, Health, IsAdmin, IsOnline, IsLockedOut,
+        /// CurrentTileID, X, Y, HeldItem, HeldAmmo. The game screen only uses the score,
+        /// health, tile, X, Y and held item columns.
+        /// </summary>
+        public DataTable GetPlayer(int playerId)
+        {
+            return ExecuteProcedure("dbo.usp_GetPlayer",
+                Param("@PlayerID", SqlDbType.Int, playerId));
+        }
+
+        /// <summary>
+        /// Calls usp_GetNestContents. One row per item in the player's nest:
+        /// ItemID, ItemName, Ammo.
+        /// </summary>
+        public DataTable GetNestContents(int playerId)
+        {
+            return ExecuteProcedure("dbo.usp_GetNestContents",
+                Param("@PlayerID", SqlDbType.Int, playerId));
+        }
+
+        /// <summary>
+        /// Calls usp_GetBoard. One row per tile: TileID, X, Y, Goose, Npc, Item, NestOf.
+        /// </summary>
+        public DataTable GetBoard()
+        {
+            return ExecuteProcedure("dbo.usp_GetBoard");
+        }
+
+        /// <summary>
         /// old prototype method (usp_TestMovePlayer).
         /// GamePlayForm still calls this until it is switched later
         /// </summary>

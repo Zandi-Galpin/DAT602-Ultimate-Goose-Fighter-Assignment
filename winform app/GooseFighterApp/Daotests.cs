@@ -45,6 +45,8 @@ namespace GooseFighterApp
             RunGroup("CRUD 10 Adding new players", AddPlayerTests);
             RunGroup("CRUD 11 Updating players", UpdatePlayerTests);
             RunGroup("CRUD 12 Deleting players", DeletePlayerTests);
+            RunGroup("Spawn  Putting a new player on the map", SpawnPlayerTests);
+            RunGroup("Reads  Procedures that fill the forms", ReadTests);
 
             _log.AppendLine();
             _log.AppendLine("TOTAL: " + _passed + " passed, " + _failed + " failed");
@@ -325,6 +327,66 @@ namespace GooseFighterApp
 
         // Helper methods
 
+        // Spawning a new player
+
+        private void SpawnPlayerTests()
+        {
+            Expect("player doesn't exist", () => _game.SpawnPlayer(999), "SpawnStatus", "PLAYER_NOT_FOUND");
+            Expect("admins don't spawn", () => _game.SpawnPlayer(1), "SpawnStatus", "NOT_FOR_ADMIN");
+            Expect("offline player", () => _game.SpawnPlayer(5), "SpawnStatus", "NOT_ONLINE");
+
+            // register a new player (online, no tile yet) and spawn them
+            DataTable created = _login.Register("spawn@example.com", "SpawnGoose", "Passw0rd!");
+            int newId = Convert.ToInt32(created.Rows[0]["PlayerID"]);
+            ExpectValue("new player has no tile before spawning", () => Scalar("SELECT CurrentTileID FROM dbo.Player WHERE PlayerID = " + newId) == DBNull.Value, true);
+            DataTable spawned = Expect("first entry spawns the player", () => _game.SpawnPlayer(newId), "SpawnStatus", "SPAWNED");
+            ExpectValue("player now has a tile", () => Scalar("SELECT CurrentTileID FROM dbo.Player WHERE PlayerID = " + newId) != DBNull.Value, true);
+            ExpectValue("a nest was created on the spawn tile", () => Scalar("SELECT COUNT(*) FROM dbo.Nest WHERE PlayerID = " + newId + " AND TileID = " + spawned.Rows[0]["TileID"]), 1);
+            Expect("second entry keeps the same tile", () => _game.SpawnPlayer(newId), "SpawnStatus", "RETURNED");
+            ExpectValue("still only one nest", () => Scalar("SELECT COUNT(*) FROM dbo.Nest WHERE PlayerID = " + newId), 1);
+            Expect("returning player keeps their saved tile", () => _game.SpawnPlayer(2), "SpawnStatus", "RETURNED");
+
+            // no free tile: cover every free tile with an item, then try to spawn another new player
+            DataTable second = _login.Register("spawn2@example.com", "SpawnGoose2", "Passw0rd!");
+            int secondId = Convert.ToInt32(second.Rows[0]["PlayerID"]);
+            Sql("INSERT INTO dbo.Item (ItemTypeID, TileID) SELECT 5, t.TileID FROM dbo.Tile t WHERE NOT EXISTS (SELECT 1 FROM dbo.Item i WHERE i.TileID = t.TileID);");
+            Expect("board is full", () => _game.SpawnPlayer(secondId), "SpawnStatus", "NO_FREE_TILE");
+        }
+
+        // Read procedures the forms use
+
+        private void ReadTests()
+        {
+            ExpectValue("item types: 8 rows", () => _admin.GetItemTypes().Rows.Count, 8);
+            ExpectValue("item types: first is Baseball Bat", () => _admin.GetItemTypes().Rows[0]["Name"], "Baseball Bat");
+
+            DataTable players = _admin.GetAllPlayers();
+            ExpectValue("all players: 5 rows", () => players.Rows.Count, 5);
+            ExpectValue("all players: no password column", () => players.Columns.Contains("Password"), false);
+
+            DataTable details = _admin.GetPlayer(3);
+            ExpectValue("player details: McPlayerTwoington", () => details.Rows[0]["Username"], "McPlayerTwoington");
+            ExpectValue("player details: includes the password", () => details.Rows[0]["Password"], "Passw0rd!");
+            ExpectValue("player details: unknown player gives no rows", () => _admin.GetPlayer(999).Rows.Count, 0);
+
+            DataTable state = _game.GetPlayer(2);
+            ExpectValue("player state: health 3100", () => state.Rows[0]["Health"], 3100);
+            ExpectValue("player state: tile 13 is (2,2)", () => state.Rows[0]["CurrentTileID"] + " " + state.Rows[0]["X"] + "," + state.Rows[0]["Y"], "13 2,2");
+            ExpectValue("player state: holding the Baseball Bat", () => state.Rows[0]["HeldItem"], "Baseball Bat");
+            ExpectValue("player state: player with no tile or item", () => _game.GetPlayer(5).Rows[0].IsNull("HeldItem") && _game.GetPlayer(5).Rows[0].IsNull("CurrentTileID"), true);
+
+            ExpectValue("nest contents: shield and peas", () => _game.GetNestContents(2).Rows.Count, 2);
+            ExpectValue("nest contents: player with no nest", () => _game.GetNestContents(5).Rows.Count, 0);
+
+            DataTable board = _game.GetBoard();
+            ExpectValue("board: 25 tiles", () => board.Rows.Count, 25);
+            ExpectValue("board: ZandiGoose is on tile 13", () => board.Select("TileID = 13")[0]["Goose"], "ZandiGoose");
+            ExpectValue("board: his nest is on tile 13", () => board.Select("TileID = 13")[0]["NestOf"], "ZandiGoose");
+            ExpectValue("board: NPC is on tile 11", () => board.Select("TileID = 11")[0]["Npc"], "NPC");
+            ExpectValue("board: pellet gun on tile 6", () => board.Select("TileID = 6")[0]["Item"], "Pellet Gun");
+            ExpectValue("board: offline player isn't shown on tile 7", () => board.Select("TileID = 7")[0].IsNull("Goose"), true);
+        }
+
         private void RunGroup(string title, Action body)
         {
             _log.AppendLine();
@@ -382,7 +444,7 @@ namespace GooseFighterApp
             if (passed) _passed++; else _failed++;
             _log.AppendLine((passed ? "PASS  " : "FAIL  ") + label + " -> " + detail);
         }
-        
+
         private object Scalar(string sql)
         {
             using (SqlConnection connection = _db.GetConnection())
